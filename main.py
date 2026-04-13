@@ -47,9 +47,13 @@ def load_config(path: str = "config.json") -> dict[str, object]:
 async def main():
     print("Starting main process")
     config = load_config()
-    assert config["character_names"]
 
-    jiaoben = SmartbombJiaoben(config["character_names"], discord_url=config["discord_url"], bookmark_name="Safe (1)")
+    jiaoben = SmartbombJiaoben(
+        config["character_names"],
+        discord_url=config["discord_url"],
+        bookmark_name=config["bookmark_name"],
+    )
+
     await jiaoben.run()
     print("Main process exiting")
 
