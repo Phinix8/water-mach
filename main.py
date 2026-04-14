@@ -1,26 +1,47 @@
 import asyncio
 import json
-import os
-import sys
-from multiprocessing import freeze_support
+from json import JSONDecodeError
+from pathlib import Path
+
 
 from jiaoben.jiaoben import SmartbombJiaoben
 
-
-def load_config(path: str = "config.json") -> dict:
-    sample_config = """
-{
+DEFAULT_CONFIG = {
     "character_names": ["player1", "player2", "player3"],
-    "discord_url": "https://discord.com/api/webhooks/...
-}"""
+    "discord_url": "https://discord.com/api/webhooks/...",
+    "bookmark_name": "Safe (1)",
+}
 
-    if not os.path.exists(path):
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(sample_config.strip())
-        print(f"Created example config at `{path}`. Edit it and re-run.")
-        sys.exit(0)
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+
+
+def load_config(path: str = "config.json") -> dict[str, object]:
+    # Using pathlib to handle relative paths
+    config_path = Path(path)
+
+    # Handling wrong config path and raising error on failure.
+    if not config_path.exists():
+        config_path.write_text(
+            json.dumps(DEFAULT_CONFIG, indent=4),
+            encoding="utf-8",
+        )
+        raise FileNotFoundError(
+            f"Created example config at '{config_path}'. Edit it and re-run."
+        )
+
+    # Handling invalid JSON in config file and raising error on failure.
+    try:
+        with config_path.open("r", encoding="utf-8") as f:
+            loaded_config = json.load(f)
+    except JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON in '{config_path}': {e}") from e
+
+    config = DEFAULT_CONFIG | loaded_config
+
+    #TODO Error Handling of valid input if needed.
+
+    return config
+
+
 
 
 async def main():
@@ -34,12 +55,8 @@ async def main():
 
 
 if __name__ == "__main__":
-    freeze_support()
     asyncio.run(main())
 
+#TODO: reset position after dread (in case of bump
+#TODO: BM/Loot Dread Guristas
 
-"""
-todo:
-    reset position after dread (in case of bump)
-    bookmark dread guristas
-"""
