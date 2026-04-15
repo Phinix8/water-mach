@@ -7,7 +7,7 @@ from client.eve_client import EveClient
 from client.input_controller import InputController
 from eve_ui.chat_window import CharacterStandings
 from jiaoben.behavior_tree import Blackboard, Sequence, Node, NodeStatus, RepeatUntilSuccess, Inverter, Sleep, \
-    RepeatUntilNSuccess, Repeat, PrioritySelector, ConditionalSequence, Parallel, ParallelPolicy, SetBlackboardValue
+    RepeatUntilNSuccess, Repeat, PrioritySelector, ConditionalSequence, SetBlackboardValue
 
 _WARP_STAB_MODULE_IDS = [11640]
 _SMARTBOMB_MODULE_IDS = [15931]

@@ -1,4 +1,4 @@
-from typing import List, overload, Dict
+from typing import List, Dict
 
 from eve_ui.base import ParsedUIRegion
 from memory.ui_tree import UITreeNode

@@ -1,6 +1,4 @@
-import math
-from enum import Enum
-from typing import Optional, List
+from typing import List
 
 from eve_ui.base import ParsedUIRegion
 from memory.ui_tree import UITreeNode
