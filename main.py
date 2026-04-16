@@ -4,7 +4,7 @@ from json import JSONDecodeError
 from pathlib import Path
 
 
-from jiaoben.jiaoben import SmartbombJiaoben
+from bots.bt_sbmachs import SmartbombBot
 
 DEFAULT_CONFIG = {
     "character_names": ["player1", "player2", "player3"],
@@ -37,24 +37,30 @@ def load_config(path: str = "config.json") -> dict[str, object]:
 
     config = DEFAULT_CONFIG | loaded_config
 
-    #TODO Error Handling of valid input if needed.
+    # Minimal validation for the fields the bot actually needs.
+    if not isinstance(config["character_names"], list) or not config["character_names"]:
+        raise ValueError("'character_names' must be a non-empty list of character names.")
+
+    if not isinstance(config["discord_url"], str) or not config["discord_url"].strip():
+        raise ValueError("'discord_url' must be a non-empty string.")
+
+    if not isinstance(config["bookmark_name"], str) or not config["bookmark_name"].strip():
+        raise ValueError("'bookmark_name' must be a non-empty string.")
 
     return config
-
-
 
 
 async def main():
     print("Starting main process")
     config = load_config()
 
-    jiaoben = SmartbombJiaoben(
-        config["character_names"],
+    bot = SmartbombBot(
+        client_names=config["character_names"],
         discord_url=config["discord_url"],
         bookmark_name=config["bookmark_name"],
     )
 
-    await jiaoben.run()
+    await bot.run()
     print("Main process exiting")
 
 
