@@ -3,7 +3,7 @@ import random
 import time
 from typing import List
 
-from client.eve_client import EveClient
+from client.eve_client import EvEClient
 from client.input_controller import InputController
 from eve_ui.chat_window import CharacterStandings
 from jiaoben.behavior_tree import Blackboard, Sequence, Node, NodeStatus, RepeatUntilSuccess, Inverter, Sleep, \
@@ -14,7 +14,7 @@ _SMARTBOMB_MODULE_IDS = [15931]
 
 class Utils:
     @staticmethod
-    def wait_for_context_menu_entry(client: EveClient, entry_text: str, timeout: float = 3.0, poll_interval: float = 0.05):
+    def wait_for_context_menu_entry(client: EvEClient, entry_text: str, timeout: float = 3.0, poll_interval: float = 0.05):
         """
         Waits for a specific context menu entry to appear.
 
@@ -73,7 +73,7 @@ class IsAllClientsWarping(Node):
     text on the speed-meter.
     """
     def tick(self) -> NodeStatus:
-        clients: List[EveClient] = self.blackboard.get("clients")
+        clients: List[EvEClient] = self.blackboard.get("clients")
         if all(client.ui_root.ship_ui.is_warping for client in clients):
             return NodeStatus.SUCCESS
         return NodeStatus.FAILURE
@@ -85,7 +85,7 @@ class IsAllClientsNotWarping(Node):
     text on the speed-meter.
     """
     def tick(self) -> NodeStatus:
-        clients: List[EveClient] = self.blackboard.get("clients")
+        clients: List[EvEClient] = self.blackboard.get("clients")
         if all(client.ui_root.ship_ui.is_warping is False for client in clients):
             return NodeStatus.SUCCESS
         return NodeStatus.FAILURE
@@ -97,7 +97,7 @@ class IsAnyClientWarping(Node):
     text on the speed-meter.
     """
     def tick(self) -> NodeStatus:
-        clients: List[EveClient] = self.blackboard.get("clients")
+        clients: List[EvEClient] = self.blackboard.get("clients")
         if any(client.ui_root.ship_ui.is_warping for client in clients):
             return NodeStatus.SUCCESS
         return NodeStatus.FAILURE
@@ -108,7 +108,7 @@ class InitiateWarpToSite(Node):
         self.site_name = site_name
 
     def tick(self) -> NodeStatus:
-        clients: List[EveClient] = self.blackboard.get("clients")
+        clients: List[EvEClient] = self.blackboard.get("clients")
         client0 = clients[0]
         probe_window = client0.ui_root.probe_window
 
@@ -147,7 +147,7 @@ class InitiateWarpToBookmark(Node):
         self.bookmark_name = bookmark_name
 
     def tick(self) -> NodeStatus:
-        clients: List[EveClient] = self.blackboard.get("clients")
+        clients: List[EvEClient] = self.blackboard.get("clients")
         client0 = clients[0]
         locations_window = client0.ui_root.locations
 
@@ -182,7 +182,7 @@ class ActivateModuleAcrossClients(Node):
         self.end_client_index = end_client_index
 
     def tick(self) -> NodeStatus:
-        clients: List[EveClient] = self.blackboard.get("clients")
+        clients: List[EvEClient] = self.blackboard.get("clients")
         print("[INFO] Activating modules across clients")
 
         for client in clients[self.start_client_index:self.end_client_index]:
@@ -207,7 +207,7 @@ class IsEnemiesPresent(Node):
     a known Guristas Haven enemy is present.
     """
     def tick(self) -> NodeStatus:
-        clients: List[EveClient] = self.blackboard.get("clients")
+        clients: List[EvEClient] = self.blackboard.get("clients")
         client0 = clients[0]
 
         if len(client0.ui_root.overviews) > 1:
@@ -236,7 +236,7 @@ class IsDreadNPCPresent(Node):
         requests.post(self.discord_url, json={"content": message})
 
     def tick(self) -> NodeStatus:
-        clients: List[EveClient] = self.blackboard.get("clients")
+        clients: List[EvEClient] = self.blackboard.get("clients")
         client0 = clients[0]
 
         if len(client0.ui_root.overviews) > 1:
@@ -257,7 +257,7 @@ class IsAnyClientStuckWithDread(Node):
     Places the client index in the blackboard under the key "stuck_client".
     """
     def tick(self) -> NodeStatus:
-        clients: List[EveClient] = self.blackboard.get("clients")
+        clients: List[EvEClient] = self.blackboard.get("clients")
 
         for i, client in enumerate(clients):
             if len(client.ui_root.overviews) > 1:
@@ -275,7 +275,7 @@ class IsAnyClientStuckWithDread(Node):
 class IsLocalDangerous(Node):
     """Checks if hostiles are in the local system."""
     def tick(self) -> NodeStatus:
-        clients: List[EveClient] = self.blackboard.get("clients")
+        clients: List[EvEClient] = self.blackboard.get("clients")
         client0 = clients[0]
         chat_channels = client0.ui_root.chat_windows or []
 
@@ -519,7 +519,7 @@ class SmartbombJiaoben:
         :param bookmark_name: Name of the escape bookmark.
         """
         self.bookmark_name = bookmark_name
-        self.clients = [EveClient(name) for name in client_names]
+        self.clients = [EvEClient(name) for name in client_names]
         self.discord_url = discord_url
 
     async def refresh_ui_tree_loop(self):

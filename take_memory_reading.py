@@ -4,7 +4,7 @@ import sys
 import time
 from multiprocessing import freeze_support
 
-from client.eve_client import EveClient
+from client.eve_client import EvEClient
 from memory.memory import EveMemoryReader
 
 
@@ -27,7 +27,7 @@ def load_config(path: str = "config.json") -> dict:
 def main():
     print("Taking memory reading...")
     config = load_config()
-    pids = [EveClient._get_pid_from_window_name(f"EVE - {name}")
+    pids = [EvEClient._get_pid_from_window_name(f"EVE - {name}")
             for name in config["character_names"]]
     initialized = [False] * len(pids)
 

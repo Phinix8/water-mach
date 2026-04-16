@@ -8,7 +8,7 @@ from eve_ui.ui_root import UIRoot
 from memory.ui_tree import UITree
 
 
-class EveClient:
+class EvEClient:
     @staticmethod
     def _get_pid_from_window_name(window_name: str) -> int:
         hwnd = win32gui.FindWindow(None, window_name)
