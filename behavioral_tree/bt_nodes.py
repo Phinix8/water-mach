@@ -7,8 +7,6 @@ import time
 from typing import Any,  Callable, Iterable
 
 import py_trees
-from poetry.console.commands import self
-from py_trees import common
 from py_trees.common import Access, Status
 
 from interface.client.eve_client import EvEClient
@@ -115,7 +113,7 @@ class PauseUntilInput(EveBehaviour):
         self.feedback_message = "Operator resumed execution"
         return Status.SUCCESS
 
-class SetBlackBoardValue(EveBehaviour):
+class SetBlackboardValue(EveBehaviour):
     """Write a static or return value of callable to Blackboard.
         Customized for better readability.
     """
