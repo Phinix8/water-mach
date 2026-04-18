@@ -3,8 +3,8 @@ from typing import Optional
 import win32gui
 import win32process
 
-from client.input_controller import InputController
-from eve_ui.ui_root import UIRoot
+from interface.client.input_controller import InputController
+from interface.eve_ui.ui_root import UIRoot
 from memory.ui_tree import UITree
 
 

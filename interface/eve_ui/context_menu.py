@@ -1,6 +1,6 @@
 from typing import List
 
-from eve_ui.base import ParsedUIRegion
+from interface.eve_ui.base import ParsedUIRegion
 from utils.path_follower import UIPathStep, UIPathFollower
 
 

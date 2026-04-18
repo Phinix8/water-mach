@@ -308,6 +308,7 @@ class SmartbombBot:
         return py_trees.decorators.OneShot(
             name="Startup Once",
             child=startup,
+            policy=py_trees.common.OneShotPolicy.ON_SUCCESSFUL_COMPLETION,
         )
 
     def _create_escape_subtree(self) -> py_trees.behaviour.Behaviour:
@@ -401,6 +402,25 @@ class SmartbombBot:
             ]
         )
         return break_branch
+
+    def _create_local_danger_branch(self) -> py_trees.behaviour.Behaviour:
+        """
+        Safety branch for hostiles in local.
+
+        This is intentionally above breaks and work so it preempts those branches.
+        """
+        danger = py_trees.composites.Sequence(name="Local Danger Branch", memory=False)
+        danger.add_children(
+            [
+                IsLocalDangerous(),
+                PrintMessage("Hostiles detected in local. Escaping."),
+                self._create_escape_subtree(),
+                PrintMessage("Verify safety, then press Enter to continue."),
+                PauseUntilInput(),
+            ]
+        )
+        return danger
+
 
 
     def _create_work_branch(self) -> py_trees.behaviour.Behaviour:

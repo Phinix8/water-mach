@@ -1,11 +1,11 @@
 from typing import List, Optional
 
-from eve_ui.chat_window import ChatWindowStack
-from eve_ui.context_menu import ContextMenu
-from eve_ui.locations import Locations
-from eve_ui.overview import OverviewWindow
-from eve_ui.probe_window import ProbeWindow
-from eve_ui.ship_ui import ShipUI
+from interface.eve_ui.chat_window import ChatWindowStack
+from interface.eve_ui.context_menu import ContextMenu
+from interface.eve_ui.locations import Locations
+from interface.eve_ui.overview import OverviewWindow
+from interface.eve_ui.probe_window import ProbeWindow
+from interface.eve_ui.ship_ui import ShipUI
 from memory.ui_tree import UITree, UITreeNode
 from utils.path_follower import UIPathStep, UIPathFollower
 
