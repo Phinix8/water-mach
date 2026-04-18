@@ -1,6 +1,7 @@
 import asyncio
 import random
 import time
+import traceback
 from typing import List
 
 from client.eve_client import EveClient
@@ -98,9 +99,15 @@ class IsAnyClientWarping(Node):
     """
     def tick(self) -> NodeStatus:
         clients: List[EveClient] = self.blackboard.get("clients")
-        if any(client.ui_root.ship_ui.is_warping for client in clients):
-            return NodeStatus.SUCCESS
-        return NodeStatus.FAILURE
+        for client in clients:
+            try:
+                if not client.ui_root.ship_ui.is_warping:
+                    return NodeStatus.FAILURE
+            except Exception as e:
+                print("[ALERT] Failed to check warp status for client: ", client.client_name)
+                print(e)
+                return NodeStatus.FAILURE
+        return NodeStatus.SUCCESS
 
 class InitiateWarpToSite(Node):
     def __init__(self, blackboard: Blackboard, site_name: str):
