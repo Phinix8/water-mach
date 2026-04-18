@@ -4,18 +4,102 @@ from typing import Dict
 from memory.memory import EveMemoryReader
 
 
+
+import time
+import random
+from typing import Dict, Any
+
+
+def _tree_contains_type(tree: dict, type_name: str) -> bool:
+    stack = [tree]
+
+    while stack:
+        node = stack.pop()
+
+        if node.get("type") == type_name:
+            return True
+
+        stack.extend(node.get("children", []))
+
+    return False
+
+
+def _tree_contains_child_named(tree: dict, name: str) -> bool:
+    stack = [tree]
+
+    while stack:
+        node = stack.pop()
+
+        if node.get("attrs", {}).get("_name") == name:
+            return True
+
+        stack.extend(node.get("children", []))
+
+    return False
+
+
+def is_usable_eve_root(tree: dict) -> bool:
+    """
+    Decide whether a raw tree looks like the real in-game EVE UI root.
+
+    We explicitly reject UIRoot:desktopBlurred because it contains only blur Fill
+    nodes and no useful game UI.
+    """
+    if not tree:
+        return False
+
+    if tree.get("type") != "UIRoot":
+        return False
+
+    root_name = tree.get("attrs", {}).get("_name", "")
+
+    if root_name == "desktopBlurred":
+        return False
+
+    # Best case: the ship UI exists.
+    if _tree_contains_type(tree, "ShipUI"):
+        return True
+
+    # Accept a root that at least has the normal high-level EVE UI structure.
+    has_l_main = _tree_contains_child_named(tree, "l_main")
+    has_l_viewstate = _tree_contains_child_named(tree, "l_viewstate")
+
+    return has_l_main and has_l_viewstate
+
+
 class UITreeNode:
     __slots__ = ("address", "type_", "attrs", "x", "y", "data", "parent", "children")
 
-    def __init__(self, **node):
-        self.address: int = node["address"]
-        self.type_: str = node["type"]
-        self.attrs: dict = node["attrs"]
-        self.x: int = node.get("x", 0)
-        self.y: int = node.get("y", 0)
-        self.parent: int = node.get("parent", 0)
-        self.data = dict()
-        self.children: list = []
+    def __init__(self, process_id: int):
+        self._reader = EveMemoryReader(process_id)
+
+        self._reader.initialize()
+
+        deadline = time.time() + 20.0
+        last_bad_summary = "no tree received"
+
+        while time.time() < deadline:
+            tree = self._reader.get_ui_tree()
+
+            if not tree:
+                continue
+
+            if is_usable_eve_root(tree):
+                self.root = self._load(tree)
+                return
+
+            last_bad_summary = (
+                f"type={tree.get('type')}, "
+                f"name={tree.get('attrs', {}).get('_name')}, "
+                f"children={len(tree.get('children', []))}"
+            )
+
+            time.sleep(0.25)
+
+        raise RuntimeError(
+            f"Could not find usable EVE UI root for pid={process_id}. "
+            f"Last bad root: {last_bad_summary}"
+        )
 
     @property
     def display_area(self) -> tuple[int, int, int, int]:

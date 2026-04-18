@@ -63,12 +63,27 @@ class ShipUI(ParsedUIRegion):
     ]
 
     def _parse(self):
+        self.speed_text = self._parse_speed_text()
         self.is_warping = self._parse_is_warping()
         self.module_buttons = self._parse_module_buttons()
 
+    def _parse_speed_text(self) -> str:
+        """
+        Read the raw speed label text from the ship UI.
+
+        This is useful for debugging because the behaviour tree should not only know
+        whether we think the ship is warping, but also what UI text that decision
+        came from.
+        """
+        speed_label = UIPathFollower.follow_path(self.node, self._TO_SPEED_GAUGE)
+
+        if not speed_label:
+            return ""
+
+        return speed_label.attrs.get("_setText", "") or ""
+
     def _parse_is_warping(self) -> bool:
-        text = UIPathFollower.follow_path(self.node, self._TO_SPEED_GAUGE).attrs.get("_setText", "")
-        return "warping" in text.lower()
+        return "warping" in self.speed_text.lower()
 
     def _parse_module_buttons(self) -> List[ShipUIModuleButton]:
         buttons_container = UIPathFollower.follow_path(self.node, self._TO_MODULE_BUTTONS)

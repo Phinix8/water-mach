@@ -1,5 +1,7 @@
 from typing import Optional
+import time
 
+import win32con
 import win32gui
 import win32process
 
@@ -12,6 +14,10 @@ class EvEClient:
     @staticmethod
     def _get_pid_from_window_name(window_name: str) -> int:
         hwnd = win32gui.FindWindow(None, window_name)
+
+        if not hwnd:
+            raise RuntimeError(f"Could not find EVE window: {window_name}")
+
         _, pid = win32process.GetWindowThreadProcessId(hwnd)
         return pid
 
@@ -30,13 +36,42 @@ class EvEClient:
         win32gui.EnumWindows(callback, hwnds)
         return hwnds[0] if hwnds else None
 
+    @staticmethod
+    def _prepare_window_for_memory_reader(hwnd: Optional[int]) -> None:
+        """
+        Try to make the EVE window a good candidate for initial UI root scanning.
+
+        The memory reader appears to select a UIRoot candidate during startup.
+        If the client is in a weird background/blurred state at that moment,
+        it may select UIRoot:desktopBlurred instead of the real in-space root.
+        """
+        if not hwnd:
+            return
+
+        try:
+            win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            win32gui.SetForegroundWindow(hwnd)
+            time.sleep(0.75)
+        except Exception as exc:
+            print(f"[WARN] Could not foreground EVE window before memory read: {exc}")
+
     def __init__(self, client_name: str):
         self.client_name = client_name
-        self.pid = self._get_pid_from_window_name(f"EVE - {client_name}")
-        hwnd = self._get_hwnd_from_process_id(self.pid)
-        self.input_handler = InputController(hwnd)
 
+        window_name = f"EVE - {client_name}"
+        self.pid = self._get_pid_from_window_name(window_name)
+        self.hwnd = self._get_hwnd_from_process_id(self.pid)
+        self.window_title = win32gui.GetWindowText(self.hwnd) if self.hwnd else "<no hwnd>"
+
+        print(
+            f"[INFO] Initializing client {client_name!r}: "
+            f"pid={self.pid}, title={self.window_title!r}"
+        )
+
+        self._prepare_window_for_memory_reader(self.hwnd)
+
+        self.input_handler = InputController(self.hwnd)
+
+        # Important: initialize memory reader after the window preparation.
         self.ui_tree = UITree(self.pid)
         self.ui_root = UIRoot(self.ui_tree)
-
-

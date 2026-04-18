@@ -3,8 +3,10 @@ import json
 from json import JSONDecodeError
 from pathlib import Path
 
-
 from bots.bt_sbmachs import SmartbombBot
+
+
+DEBUG_MODE = True
 
 DEFAULT_CONFIG = {
     "character_names": ["player1", "player2", "player3"],
@@ -58,6 +60,7 @@ async def main():
         client_names=config["character_names"],
         discord_url=config["discord_url"],
         bookmark_name=config["bookmark_name"],
+        debug_mode=DEBUG_MODE,
     )
 
     await bot.run()

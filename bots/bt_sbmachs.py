@@ -20,6 +20,8 @@ from behavioral_tree.bt_nodes import (
     IsDreadNpcPresent,
     IsDreadGuristaNpcPresent,
     IsEnemiesPresent,
+    AreAllShipUIsReadable,
+    IsSiteClearForDuration,
     IsLocalDangerous,
     PauseUntilInput,
     PrintMessage,
@@ -62,6 +64,8 @@ class SmartbombBot:
             min_break_time: int = int(60 * 60 * 1.5),
             max_break_time: int = int(60 * 60 * 2.5),
             tick_interval: float = 0.25,
+            debug_mode: bool = False,
+            debug_tree_interval: float = 3.0,
     ) -> None:
         self.clients = [EvEClient(name) for name in client_names]
         self.discord_url = discord_url
@@ -73,6 +77,11 @@ class SmartbombBot:
         self.max_break_time = max_break_time
         self.tick_interval = tick_interval
 
+        self.debug_mode = debug_mode
+        self.debug_tree_interval = debug_tree_interval
+        self._next_debug_tree_print = 0.0
+        self.snapshot_visitor = None
+
         # Single blackboard client for seeding shared runtime state.
         self.blackboard = py_trees.blackboard.Client(
             name="SmartbombBot Blackboard",
@@ -82,6 +91,10 @@ class SmartbombBot:
         self._seed_static_blackboard_values()
 
         self.behaviour_tree = py_trees.trees.BehaviourTree(self.create_tree())
+
+        if self.debug_mode:
+            self.snapshot_visitor = py_trees.visitors.SnapshotVisitor()
+            self.behaviour_tree.visitors.append(self.snapshot_visitor)
 
 
 ###########################################################
@@ -153,6 +166,73 @@ class SmartbombBot:
         )
         return root
 
+    def _wait_until_ship_uis_readable(self) -> py_trees.behaviour.Behaviour:
+        """
+        Wait until every configured client exposes a readable ShipUI.
+
+        This returns RUNNING while some clients are unreadable instead of failing
+        the startup sequence and causing the OneShot startup to restart.
+        """
+        wait = py_trees.composites.Selector(
+            name="Wait Until Ship UIs Readable",
+            memory=False,
+        )
+        wait.add_children(
+            [
+                self._wait_until_ship_uis_readable(),
+                self._running("Waiting For Ship UIs To Become Readable"),
+            ]
+        )
+        return wait
+
+    def _retry_until_success(
+            self,
+            child: py_trees.behaviour.Behaviour,
+            timeout: float,
+            name: str,
+    ) -> py_trees.behaviour.Behaviour:
+        """
+        Keep retrying a child until it succeeds or the timeout expires.
+
+        This is useful for UI actions, because the parsed UI can temporarily be
+        unavailable for one tick.
+        """
+        retry_selector = py_trees.composites.Selector(
+            name=f"{name} Retry Selector",
+            memory=False,
+        )
+        retry_selector.add_children(
+            [
+                child,
+                self._running(f"Retrying: {name}"),
+            ]
+        )
+
+        return py_trees.decorators.Timeout(
+            name=f"{name} Timeout ({timeout:.0f}s)",
+            child=retry_selector,
+            duration=timeout,
+        )
+
+    def _wait_until_ship_uis_readable(self) -> py_trees.behaviour.Behaviour:
+        """
+        Wait until every configured client exposes a readable ShipUI.
+
+        This returns RUNNING while some clients are unreadable instead of failing
+        the startup sequence and causing the OneShot startup to restart.
+        """
+        wait = py_trees.composites.Selector(
+            name="Wait Until Ship UIs Readable",
+            memory=False,
+        )
+        wait.add_children(
+            [
+                AreAllShipUIsReadable(),
+                self._running("Waiting For Ship UIs To Become Readable"),
+            ]
+        )
+        return wait
+
     def _wait_until_any_client_warping(self, timeout: float) -> py_trees.behaviour.Behaviour:
         """
         Wait until at least one client enters warp.
@@ -173,11 +253,20 @@ class SmartbombBot:
             child=wait_subtree,
             duration=timeout,
         )
+
     def _wait_until_all_clients_not_warping(self, timeout: float) -> py_trees.behaviour.Behaviour:
         """
-        Wait until all clients are confirmed to no longer be warping..
+        Wait until all clients are confirmed to no longer be warping.
+
+        If detection times out, do NOT fail upward and restart the work branch.
+        Instead, pause for manual confirmation. This avoids the dangerous behaviour
+        where the bot lands in a site, fails to detect arrival, and then warps to
+        another site.
         """
-        wait_subtree = py_trees.composites.Selector(name="Wait For Warp Finish", memory=False)
+        wait_subtree = py_trees.composites.Selector(
+            name="Wait For Warp Finish",
+            memory=False,
+        )
         wait_subtree.add_children(
             [
                 IsAllClientsNotWarping(),
@@ -185,37 +274,49 @@ class SmartbombBot:
             ]
         )
 
-        return py_trees.decorators.Timeout(
+        automatic_wait = py_trees.decorators.Timeout(
             name=f"Warp Finish Timeout ({timeout:.0f}s)",
             child=wait_subtree,
             duration=timeout,
         )
 
-    def _wait_until_site_clear(self, timeout: float) -> py_trees.behaviour.Behaviour:
-        """
-        Temporary first-pass site completion check.
-
-        Current behavior:
-        - RUNNING while enemies are present
-        - SUCCESS as soon as the overview no longer shows known site enemies
-        - FAILURE if the timeout is exceeded
-
-        #TODO Note: Currently only checks this once. Migth cause errors.
-        """
-        wait_subtree = py_trees.composites.Selector(name="Wait Until Site Clear", memory=False)
-        wait_subtree.add_children(
+        manual_recovery = py_trees.composites.Sequence(
+            name="Manual Warp Finish Confirmation",
+            memory=True,
+        )
+        manual_recovery.add_children(
             [
-                py_trees.decorators.Inverter(
-                    name="No Enemies Present?",
-                    child=IsEnemiesPresent(),
+                PrintMessage(
+                    "Warp finish detection timed out. "
+                    "Check whether all ships have landed."
                 ),
-                self._running("Enemies Still Present"),
+                PauseUntilInput("If all ships are out of warp, press Enter to continue..."),
             ]
         )
 
+        root = py_trees.composites.Selector(
+            name="Wait For Warp Finish Or Manual Confirm",
+            memory=False,
+        )
+        root.add_children(
+            [
+                automatic_wait,
+                manual_recovery,
+            ]
+        )
+
+        return root
+
+    def _wait_until_site_clear(self, timeout: float) -> py_trees.behaviour.Behaviour:
+        """
+        Wait until the site appears clear for a stable duration.
+
+        This replaces the old single-check inverter logic. A missing/unreadable
+        overview now means "keep waiting", not "site complete".
+        """
         return py_trees.decorators.Timeout(
             name=f"Site Clear Timeout ({timeout:.0f}s)",
-            child=wait_subtree,
+            child=IsSiteClearForDuration(clear_duration=5.0),
             duration=timeout,
         )
 
@@ -288,8 +389,13 @@ class SmartbombBot:
             [
                 PrintMessage("Smartbomb bot ready."),
                 PauseUntilInput("Press Enter to start the bot..."),
+
                 PrintMessage("Ensuring no hostiles are present before starting..."),
                 self._wait_until_local_safe(),
+
+                PrintMessage("Checking ship UI readability..."),
+                self._wait_until_ship_uis_readable(),
+
                 SetCurrentTime("start_time"),
                 SetCurrentTime("last_break"),
                 SetBlackboardValue(
@@ -351,9 +457,13 @@ class SmartbombBot:
         complete.add_children(
             [
                 Delay(5, name="Short Landing Delay"),
-                ActivateModuleAcrossClients(
-                    module_type_ids=_SMARTBOMB_MODULE_IDS,
-                    start_client_index=1,
+                self._retry_until_success(
+                    child=ActivateModuleAcrossClients(
+                        module_type_ids=_SMARTBOMB_MODULE_IDS,
+                        start_client_index=1,
+                        name="Activate Smartbombs",
+                    ),
+                    timeout=10,
                     name="Activate Smartbombs",
                 ),
                 Delay(60, name="Do Not Check Completion Too Early"),
@@ -484,38 +594,75 @@ class SmartbombBot:
     ### Runtime Loop
     ###########################################################
 
+    def _debug_print_tree(self) -> None:
+        """
+        Print the currently visited part of the behavior tree.
+
+        This is intentionally rate-limited, otherwise the console becomes useless
+        because the bot ticks several times per second.
+        """
+        if not self.debug_mode or self.snapshot_visitor is None:
+            return
+
+        now = time.monotonic()
+        if now < self._next_debug_tree_print:
+            return
+
+        self._next_debug_tree_print = now + self.debug_tree_interval
+
+        print()
+        print("[DEBUG] Current behavior tree state:")
+        print(
+            py_trees.display.unicode_tree(
+                root=self.behaviour_tree.root,
+                show_only_visited=True,
+                show_status=True,
+                visited=self.snapshot_visitor.visited,
+                previously_visited=self.snapshot_visitor.previously_visited,
+            )
+        )
+
     #TODO: refreshing the ui_tree should be done in threads rather then subsequential
 
     async def refresh_ui_tree_loop(self) -> None:
         """Continuously refresh the parsed UI trees for all clients."""
-        while True:
+        while self.blackboard.running:
             for client in self.clients:
-                client.ui_tree.refresh()
+                try:
+                    client.ui_tree.refresh()
+                except Exception as exc:
+                    if self.debug_mode:
+                        print(
+                            f"[DEBUG] UI refresh failed for "
+                            f"{client.client_name}: {exc}"
+                        )
+
             await asyncio.sleep(0.1)
 
     def logic_loop(self) -> None:
         """
         Tick the behavior tree until the blackboard says the bot should stop.
 
-        The root may return SUCCESS many times during normal operation
+        Important:
+        `behaviour_tree.setup()` must not happen here because this function runs
+        in a worker thread via asyncio.to_thread(), and py_trees.setup() uses
+        Python signal handling.
         """
-        self.behaviour_tree.setup(timeout=15)
-
         while self.blackboard.running:
             self.behaviour_tree.tick()
-
-            # Optional lightweight debug hook:
-            # print(py_trees.display.unicode_tree(self.behaviour_tree.root, show_status=True))
-
+            self._debug_print_tree()
             time.sleep(self.tick_interval)
 
     async def run(self) -> None:
         """
         Run both the UI refresh loop and the behavior-tree logic loop.
 
-        The logic loop runs in a thread because it contains blocking operations
-        such as input() pauses and time.sleep() between ticks.
+        The behavior tree must be set up from the main thread before the logic loop
+        is moved into a worker thread.
         """
+        self.behaviour_tree.setup(timeout=15)
+
         refresh_task = asyncio.create_task(self.refresh_ui_tree_loop())
         logic_task = asyncio.create_task(asyncio.to_thread(self.logic_loop))
+
         await asyncio.gather(refresh_task, logic_task)

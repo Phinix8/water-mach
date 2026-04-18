@@ -272,6 +272,64 @@ class SendDiscordWebhook(EveBehaviour):
         self.feedback_message = "Webhook sent"
         return Status.SUCCESS
 
+class AreAllShipUIsReadable(EveBehaviour):
+    """
+    SUCCESS if every configured client has a readable ShipUI.
+
+    This is a startup safety check. If some clients cannot expose ShipUI, warp
+    detection and module activation will be unreliable.
+    """
+
+    def __init__(self, name: str = "All Ship UIs Readable?") -> None:
+        super().__init__(name=name)
+        self.register_reads("eve_clients")
+
+    def update(self) -> Status:
+        try:
+            clients = self.get_clients()
+        except Exception as exc:
+            self.feedback_message = f"Error reading clients: {exc}"
+            return Status.FAILURE
+
+        unreadable: list[str] = []
+
+        for index, client in enumerate(clients):
+            try:
+                ship_ui = client.ui_root.ship_ui
+                if ship_ui is None:
+                    debug_summary = getattr(
+                        client.ui_root,
+                        "ship_ui_debug_summary",
+                        "no ship ui debug summary",
+                    )
+
+                    root_summary = getattr(
+                        client.ui_root,
+                        "root_debug_summary",
+                        "no root debug summary",
+                    )
+
+                    window_title = getattr(client, "window_title", "<no title>")
+                    pid = getattr(client, "pid", "<no pid>")
+
+                    unreadable.append(
+                        f"{index}:{client.client_name} "
+                        f"(pid={pid}, title={window_title!r}; "
+                        f"{debug_summary}; {root_summary})"
+                    )
+            except Exception as exc:
+                root_summary = getattr(client.ui_root, "root_debug_summary", "no root summary")
+                unreadable.append(
+                    f"{index}:{client.client_name} ({debug_summary}; {root_summary})"
+                )
+
+        if unreadable:
+            self.feedback_message = "Unreadable: " + " | ".join(unreadable)
+            return Status.FAILURE
+
+        self.feedback_message = "All ShipUIs readable"
+        return Status.SUCCESS
+
 ##############################################
 ### Warp state checks
 ##############################################
@@ -333,20 +391,49 @@ class IsAllClientsNotWarping(EveBehaviour):
     def update(self) -> Status:
         try:
             clients = self.get_clients()
-            if not clients:
-                self.feedback_message = "No clients"
-                return Status.FAILURE
-
-            result = all(
-                client.ui_root.ship_ui is not None and client.ui_root.ship_ui.is_warping is False
-                for client in clients
-            )
         except Exception as exc:
-            self.feedback_message = f"Error reading ship UI: {exc}"
+            self.feedback_message = f"Error reading clients: {exc}"
             return Status.FAILURE
 
-        self.feedback_message = str(result)
-        return Status.SUCCESS if result else Status.FAILURE
+        if not clients:
+            self.feedback_message = "No clients"
+            return Status.FAILURE
+
+        all_not_warping = True
+        client_states: list[str] = []
+
+        for index, client in enumerate(clients):
+            try:
+                ship_ui = client.ui_root.ship_ui
+
+                if ship_ui is None:
+                    all_not_warping = False
+                    debug_summary = getattr(client.ui_root, "ship_ui_debug_summary", "no debug summary")
+
+                    client_states.append(
+                        f"{index}:{client.client_name}: ship_ui=None, {debug_summary}"
+                    )
+                    continue
+
+                speed_text = getattr(ship_ui, "speed_text", "")
+                is_warping = ship_ui.is_warping
+
+                client_states.append(
+                    f"{index}:{client.client_name}: warping={is_warping}, speed={speed_text!r}"
+                )
+
+                if is_warping is not False:
+                    all_not_warping = False
+
+            except Exception as exc:
+                all_not_warping = False
+                client_states.append(
+                    f"{index}:{getattr(client, 'client_name', '?')}: error={exc}"
+                )
+
+        self.feedback_message = " | ".join(client_states)
+        return Status.SUCCESS if all_not_warping else Status.FAILURE
+
 
 # ============================================================================
 # Overview / local state checks
@@ -417,6 +504,77 @@ class IsEnemiesPresent(EveBehaviour):
 
         self.feedback_message = "No known site enemies visible"
         return Status.FAILURE
+
+class IsSiteClearForDuration(EveBehaviour):
+    """
+    SUCCESS only if no known site enemies are visible for a continuous duration.
+
+    Important behavior:
+    - enemies visible       -> RUNNING and reset clear timer
+    - overview unreadable   -> RUNNING and reset clear timer
+    - no enemies briefly    -> RUNNING
+    - no enemies long enough -> SUCCESS
+
+    This avoids treating a single bad overview read as "site complete".
+    """
+
+    def __init__(
+        self,
+        clear_duration: float = 5.0,
+        enemy_name_tokens: tuple[str, ...] = ("Pith", "Dread Guristas"),
+        name: str = "Site Clear For Duration?",
+    ) -> None:
+        super().__init__(name=name)
+        self.clear_duration = clear_duration
+        self.enemy_name_tokens = enemy_name_tokens
+        self.clear_since: float | None = None
+        self.register_reads("eve_clients")
+
+    def initialise(self) -> None:
+        self.clear_since = None
+
+    def update(self) -> Status:
+        try:
+            client0 = self.get_main_client()
+            overviews = client0.ui_root.overviews
+
+            if len(overviews) != 1:
+                self.clear_since = None
+                self.feedback_message = "Overview unreadable: expected exactly one overview"
+                return Status.RUNNING
+
+            overview = overviews[0]
+
+        except Exception as exc:
+            self.clear_since = None
+            self.feedback_message = f"Overview read failed: {exc}"
+            return Status.RUNNING
+
+        for entry in overview.entries:
+            entry_name = entry.fields.get("Name", "")
+
+            if any(token in entry_name for token in self.enemy_name_tokens):
+                self.clear_since = None
+                self.feedback_message = f"Enemy still present: {entry_name}"
+                return Status.RUNNING
+
+        now = time.time()
+
+        if self.clear_since is None:
+            self.clear_since = now
+
+        clear_elapsed = now - self.clear_since
+
+        if clear_elapsed >= self.clear_duration:
+            self.feedback_message = f"No enemies for {clear_elapsed:.1f}s"
+            return Status.SUCCESS
+
+        self.feedback_message = f"No enemies for {clear_elapsed:.1f}/{self.clear_duration:.1f}s"
+        return Status.RUNNING
+
+    def terminate(self, new_status: Status) -> None:
+        if new_status != Status.RUNNING:
+            self.clear_since = None
 
 class IsDreadNpcPresent(EveBehaviour):
     """
