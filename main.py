@@ -7,6 +7,7 @@ from bots.bt_sbmachs import SmartbombBot
 
 
 DEBUG_MODE = True
+MANUAL_CLIENT_INIT = True
 
 DEFAULT_CONFIG = {
     "character_names": ["player1", "player2", "player3"],
@@ -61,6 +62,7 @@ async def main():
         discord_url=config["discord_url"],
         bookmark_name=config["bookmark_name"],
         debug_mode=DEBUG_MODE,
+        manual_client_init=MANUAL_CLIENT_INIT,
     )
 
     await bot.run()

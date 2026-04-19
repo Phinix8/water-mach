@@ -65,9 +65,18 @@ class SmartbombBot:
             max_break_time: int = int(60 * 60 * 2.5),
             tick_interval: float = 0.25,
             debug_mode: bool = False,
-            debug_tree_interval: float = 3.0,
+            debug_tree_interval: float = 1.0,
+            manual_client_init: bool = False,
     ) -> None:
-        self.clients = [EvEClient(name) for name in client_names]
+        self.clients = []
+
+        for name in client_names:
+            client = EvEClient(name, manual_prepare=manual_client_init)
+            self.clients.append(client)
+
+        for client in self.clients:
+            client.ui_tree.resume_reader()
+
         self.discord_url = discord_url
         self.bookmark_name = bookmark_name
         self.site_name = site_name

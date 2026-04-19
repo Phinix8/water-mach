@@ -39,11 +39,8 @@ class EvEClient:
     @staticmethod
     def _prepare_window_for_memory_reader(hwnd: Optional[int]) -> None:
         """
-        Try to make the EVE window a good candidate for initial UI root scanning.
-
-        The memory reader appears to select a UIRoot candidate during startup.
-        If the client is in a weird background/blurred state at that moment,
-        it may select UIRoot:desktopBlurred instead of the real in-space root.
+        Try to avoid initializing the memory reader while EVE exposes only
+        UIRoot:desktopBlurred.
         """
         if not hwnd:
             return
@@ -55,7 +52,36 @@ class EvEClient:
         except Exception as exc:
             print(f"[WARN] Could not foreground EVE window before memory read: {exc}")
 
-    def __init__(self, client_name: str):
+    @staticmethod
+    def _manual_prepare_window(client_name: str, hwnd: Optional[int]) -> None:
+        """
+        Debug/manual fallback for Windows foreground restrictions.
+
+        The memory reader appears to select a UIRoot candidate during
+        initialization. If the client is blurred/backgrounded at that moment,
+        it can lock onto UIRoot:desktopBlurred.
+
+        In debug mode, we let the user explicitly bring the correct client to
+        the front before initializing the memory reader.
+        """
+        if hwnd:
+            try:
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            except Exception:
+                pass
+
+        print()
+        print(f"[MANUAL INIT] Prepare EVE client: {client_name!r}")
+        print("  1. Bring this exact EVE window to the foreground.")
+        print("  2. Make sure the ship HUD is visible.")
+        print("  3. Make sure the client is fully loaded and in space.")
+        print("  4. Then press Enter here.")
+        input(f"[MANUAL INIT] Press Enter when 'EVE - {client_name}' is ready...")
+
+        # Give EVE/memory a small moment to settle after the window change.
+        time.sleep(0.75)
+
+    def __init__(self, client_name: str, manual_prepare: bool = False):
         self.client_name = client_name
 
         window_name = f"EVE - {client_name}"
@@ -65,13 +91,21 @@ class EvEClient:
 
         print(
             f"[INFO] Initializing client {client_name!r}: "
-            f"pid={self.pid}, title={self.window_title!r}"
+            f"[INFO] Window mapping: wanted={window_name!r}, "
+            f"hwnd={self.hwnd}, pid={self.pid}, title={self.window_title!r}"
         )
 
-        self._prepare_window_for_memory_reader(self.hwnd)
+        if manual_prepare:
+            self._manual_prepare_window(client_name, self.hwnd)
+        else:
+            self._prepare_window_for_memory_reader(self.hwnd)
 
         self.input_handler = InputController(self.hwnd)
 
-        # Important: initialize memory reader after the window preparation.
+        # Important: initialize memory reader only after preparation.
         self.ui_tree = UITree(self.pid)
         self.ui_root = UIRoot(self.ui_tree)
+
+        # Prevent already-initialized clients from continuously reading memory while
+        # the next clients are still being initialized.
+        self.ui_tree.pause_reader()

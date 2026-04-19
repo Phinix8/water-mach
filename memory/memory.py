@@ -12,6 +12,7 @@ class WorkerHandle:
     pid: int
     process: "multiprocessing.Process"
     stop_event: "multiprocessing.Event"
+    pause_event: "multiprocessing.Event"
     shm_name: str
     data_capacity: int
     shm: Optional[shared_memory.SharedMemory] = None
@@ -63,9 +64,18 @@ class EveMemoryReader:
         shm_owner = shared_memory.SharedMemory(name=shm_name, create=True, size=shm_size)
         shm_owner.buf[:self._SHM_HEADER_SIZE] = b"\x00" * self._SHM_HEADER_SIZE
         stop_event = ctx.Event()
+        pause_event = ctx.Event()
         proc = ctx.Process(
             target=self._worker_read_loop,
-            args=(self.pid, shm_name, stop_event, period_s, data_capacity, error_capacity),
+            args=(
+                self.pid,
+                shm_name,
+                stop_event,
+                pause_event,
+                period_s,
+                data_capacity,
+                error_capacity,
+            ),
             daemon=True
         )
         proc.start()
@@ -74,6 +84,7 @@ class EveMemoryReader:
             pid=self.pid,
             process=proc,
             stop_event=stop_event,
+            pause_event=pause_event,
             shm_name=shm_name,
             data_capacity=data_capacity,
             shm_owner=shm_owner
@@ -177,6 +188,7 @@ class EveMemoryReader:
             process_id: int,
             shm_name: str,
             stop_event: "multiprocessing.Event",
+            pause_event: "multiprocessing.Event",
             period_s: float,
             data_capacity: int,
             error_capacity: int
@@ -216,6 +228,10 @@ class EveMemoryReader:
                 return
 
             while not stop_event.is_set():
+                if pause_event.is_set():
+                    time.sleep(0.25)
+                    continue
+
                 start = time.time()
                 dll.read_ui_trees()
                 json_bytes = dll.get_ui_json()
@@ -343,6 +359,58 @@ class EveMemoryReader:
 
         return dll
 
+    def shutdown(self) -> None:
+        """
+        Stop the child memory-reader process and clean up shared memory.
+
+        This is needed when initialization fails and we want to retry with a fresh
+        native reader process.
+        """
+        if self.handle is None:
+            return
+
+        try:
+            self.handle.stop_event.set()
+
+            if self.handle.process.is_alive():
+                self.handle.process.join(timeout=2.0)
+
+            if self.handle.process.is_alive():
+                self.handle.process.terminate()
+                self.handle.process.join(timeout=2.0)
+
+        finally:
+            if self.handle.shm is not None:
+                try:
+                    self.handle.shm.close()
+                except Exception:
+                    pass
+
+            if self.handle.shm_owner is not None:
+                try:
+                    self.handle.shm_owner.close()
+                except Exception:
+                    pass
+
+                try:
+                    self.handle.shm_owner.unlink()
+                except FileNotFoundError:
+                    pass
+                except Exception:
+                    pass
+
+            self.handle = None
+
+def pause(self) -> None:
+    """Pause the background native reader loop."""
+    if self.handle is not None:
+        self.handle.pause_event.set()
+
+
+def resume(self) -> None:
+    """Resume the background native reader loop."""
+    if self.handle is not None:
+        self.handle.pause_event.clear()
 
 if __name__ == "__main__":
     readers = [EveMemoryReader(25812), EveMemoryReader(27676)]
