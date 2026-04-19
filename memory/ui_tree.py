@@ -157,7 +157,7 @@ class UITree:
 
     def _initialize_until_usable_root(
             self,
-            attempts: int = 2,
+            attempts: int = 5,
             per_attempt_timeout: float = 90.0,
     ) -> UITreeNode:
         """

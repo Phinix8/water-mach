@@ -1,0 +1,1871 @@
+#define _CRTDBG_MAP_ALLOC
+#include <crtdbg.h>
+#include "eve-memory-reader.h"
+
+
+#define PROCESS_NAME "exefile.exe"
+
+ProcessSample* ps;
+ULONGLONG primary_ui_root;
+Addresses* ui_roots;
+ULONGLONG number_of_nodes = 0;
+ULONGLONG cache_last_flushed = 0;
+char* ui_json = NULL;
+HANDLE hProcess;
+
+char* DICT_KEYS_OF_INTEREST[34] = {
+	"_top", "_left", "_width", "_height", "_displayX", "_displayY",
+	"_displayHeight", "_displayWidth",
+	"_name", "_text", "_setText",
+	"children",
+	"texturePath", "_bgTexturePath",
+	"_hint", "_display",
+
+	//  HPGauges
+	"lastShield", "lastArmor", "lastStructure",
+
+	//  Found in "ShipHudSpriteGauge"
+	"_lastValue",
+
+	//  Found in "ModuleButton"
+	"ramp_active", "isDeactivating", "autorepeat", "online", "quantity",
+
+	//  Found in the Transforms contained in "ShipModuleButtonRamps"
+	"_rotation",
+
+	//  Found under OverviewEntry in Sprite named "iconSprite"
+	"_color",
+
+	//  Found in "SE_TextlineCore"
+	"_sr",
+
+	//  Found in "_sr" Bunch
+	//	Filtered out in read_python_type_bunch()
+	//"htmlstr",
+
+	"_texturePath",
+	//"_texturePath", "_opacity", "_bgColor", "isExpanded"
+	NULL
+};
+
+ULONGLONG find_min(const ULONGLONG* arr, UINT length) {
+	// returns the minimum value of array
+	size_t i;
+	ULONGLONG minimum = arr[0];
+	for (i = 1; i < length; ++i) {
+		if (minimum > arr[i]) {
+			minimum = arr[i];
+		}
+	}
+	return minimum;
+}
+
+ULONGLONG find_max(const ULONGLONG* arr, UINT length) {
+	// returns the minimum value of array
+	size_t i;
+	ULONGLONG maximum = arr[0];
+	for (i = 1; i < length; ++i) {
+		if (maximum < arr[i]) {
+			maximum = arr[i];
+		}
+	}
+	return maximum;
+}
+
+void read_committed_memory_regions_from_pid(DWORD pid, BOOL with_content)
+{
+	hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+	ULONGLONG lpAddress = 0x0;
+	while (TRUE)
+	{
+		MEMORY_BASIC_INFORMATION64 lpBuffer;
+		SIZE_T result = VirtualQueryEx(hProcess, lpAddress, &lpBuffer, sizeof(MEMORY_BASIC_INFORMATION64));
+
+		if (lpAddress == lpBuffer.BaseAddress + lpBuffer.RegionSize)
+		{
+			break;
+		}
+
+		lpAddress = lpBuffer.BaseAddress + lpBuffer.RegionSize;
+
+		if (lpBuffer.State != MEM_COMMIT)
+		{
+			continue;
+		}
+
+		DWORD protectionsFlagsToSkip = PAGE_GUARD | PAGE_NOACCESS;
+		DWORD matchingFlagsToSkip = protectionsFlagsToSkip & lpBuffer.Protect;
+
+		if (matchingFlagsToSkip != 0)
+		{
+			continue;
+		}
+
+		byte* regionContent = NULL;
+
+		if (with_content)
+		{
+			ULONGLONG bytesRead = 0;
+			byte* regionContentBuffer = malloc(sizeof(byte) * lpBuffer.RegionSize);
+			if (!ReadProcessMemory(hProcess, lpBuffer.BaseAddress, regionContentBuffer, lpBuffer.RegionSize, &bytesRead))
+			{
+				if (regionContentBuffer != NULL)
+				{
+					free(regionContentBuffer);
+					regionContentBuffer = NULL;
+				}
+				exit(1);
+			}
+
+			if (bytesRead != lpBuffer.RegionSize)
+			{
+				if (regionContentBuffer != NULL)
+				{
+					free(regionContentBuffer);
+					regionContentBuffer = NULL;
+				}
+				// TODO: this is recoverable, just try again
+				printf("Failed to ReadProcessMemory at 0x%llx, only read %lld bytes; expecting %lld bytes.", lpBuffer.BaseAddress, bytesRead, lpBuffer.RegionSize);
+				exit(1);
+			}
+
+			regionContent = regionContentBuffer;
+		}
+
+		CommittedRegion* cr = malloc(sizeof(CommittedRegion));
+		if (cr == NULL)
+		{
+			printf("error creating CommittedRegion");
+			exit(1);
+		}
+		cr->address = lpBuffer.BaseAddress;
+		cr->region_size = lpBuffer.RegionSize;
+		cr->content = regionContent;
+		InsertCommittedRegion(ps, cr);
+	}
+}
+
+void get_process_sample_from_pid(DWORD pid)
+{
+	ps = malloc(sizeof(ProcessSample));
+	InitProcessSample(ps);
+
+	// Only collect committed region addresses and sizes.
+	// Do NOT permanently copy every committed memory region.
+	// Candidate search reads regions temporarily later and frees them again.
+	read_committed_memory_regions_from_pid(pid, FALSE);
+}
+
+byte* slice_byte_array(byte* original, ULONGLONG size, UINT start, UINT end)
+{
+	byte* sliced = malloc(sizeof(byte) * size);
+	UINT bytes_sliced = 0;
+	UINT i;
+	for (i = 0; i < size; ++i)
+		if (start <= i && i < end)
+			sliced[bytes_sliced++] = original[i];
+	return sliced;
+}
+
+ULONGLONG cast_byte_array_to_ulong(byte* content, ULONGLONG size)
+{
+	ULONGLONG result = 0;
+	UINT i;
+	for (i = 0; i < size; ++i)
+		result |= ((ULONGLONG)content[i]) << (i * 8);
+	return result;
+}
+
+DOUBLE cast_byte_array_to_double(byte* content)
+{
+	DOUBLE result;
+	memcpy(&result, content, sizeof(DOUBLE));
+	return result;
+}
+
+ULONGLONG* cast_byte_array_to_ulong_array(byte* content, ULONGLONG size)
+{
+	ULONGLONG* result = malloc(sizeof(ULONGLONG) * (size/sizeof(ULONGLONG)));
+	UINT ulongs_created = 0;
+	UINT i;
+	for (i = 0; i < size; i += 8)
+	{
+		result[ulongs_created++] = (ULONGLONG)(
+			(ULONGLONG)content[i] |
+			((ULONGLONG)content[i+1] << 8) |
+			((ULONGLONG)content[i+2] << 16) |
+			((ULONGLONG)content[i+3] << 24) |
+			((ULONGLONG)content[i+4] << 32) |
+			((ULONGLONG)content[i+5] << 40) |
+			((ULONGLONG)content[i+6] << 48) |
+			((ULONGLONG)content[i+7] << 56)
+		);
+	}
+	return result;
+}
+
+byte* read_bytes(ULONGLONG address, ULONGLONG length, ULONGLONG* bytes_read)
+{
+
+	byte* regionContentBuffer = malloc(sizeof(byte) * length);
+	if (!ReadProcessMemory(hProcess, address, regionContentBuffer, _msize(regionContentBuffer), bytes_read))
+	{
+		if (regionContentBuffer != NULL)
+		{
+			free(regionContentBuffer);
+			regionContentBuffer = NULL;
+		}
+		return NULL;
+	}
+
+	if (regionContentBuffer == NULL)
+		return NULL;
+
+	if (bytes_read == 0)
+	{
+		free(regionContentBuffer);
+		regionContentBuffer = NULL;
+		return NULL;
+	}
+
+	if (ULLONG_MAX < bytes_read)
+	{
+		free(regionContentBuffer);
+		regionContentBuffer = NULL;
+		return NULL;
+	}
+
+	return regionContentBuffer;
+}
+
+char* read_string_from_address(ULONGLONG address)
+{
+	ULONGLONG bytes_read = 0;
+	byte* as_memory = read_bytes(address, 0x100, &bytes_read);
+
+	if (as_memory == NULL)
+		return NULL;
+
+	UINT length = 0;
+	UINT i = 0;
+	do
+		if (as_memory[++length] == 0)
+			break;
+	while (i++ < 0x100);
+	byte* null_terminated = slice_byte_array(as_memory, 0x100, 0, length);
+	char* response = malloc(sizeof(char) * length + 1);
+	memcpy_s(response, length, as_memory, length);
+	response[length] = '\0';
+	free(null_terminated);
+	free(as_memory);
+	null_terminated = NULL;
+	as_memory = NULL;
+	return response;
+}
+
+ULONGLONG* read_memory_region_content_as_ulong_array(CommittedRegion* cr)
+{
+	ULONGLONG bytes_read = 0;
+	byte* as_byte_array = read_bytes(cr->address, cr->region_size, &bytes_read);
+
+	if (as_byte_array == NULL)
+		return NULL;
+
+	ULONGLONG* response = cast_byte_array_to_ulong_array(as_byte_array, cr->region_size);
+	free(as_byte_array);
+	as_byte_array = NULL;
+	return response;
+}
+
+Addresses* new_empty_addresses()
+{
+	Addresses* candidates = malloc(sizeof(Addresses));
+	if (candidates == NULL)
+		return NULL;
+
+	InitAddresses(candidates);
+	return candidates;
+}
+
+Addresses* find_python_type_object_type_candidates_within_region(CommittedRegion* cr)
+{
+	Addresses* candidates = malloc(sizeof(Addresses));
+	InitAddresses(candidates);
+	ULONGLONG* memory_region_ulong = read_memory_region_content_as_ulong_array(cr);
+	if (memory_region_ulong == NULL)
+		return candidates;
+
+	UINT candidate_address_index;
+	for (candidate_address_index = 0; candidate_address_index < (cr->region_size / 8) - 4; ++candidate_address_index)
+	{
+		ULONGLONG candidate_address_in_process = cr->address + (ULONGLONG)candidate_address_index * 8;
+		ULONGLONG candidate_ob_type = memory_region_ulong[candidate_address_index + 1];
+
+		if (candidate_ob_type != candidate_address_in_process)
+			continue;
+
+		char* candidate_tp_name = read_string_from_address(memory_region_ulong[candidate_address_index + 3]);
+
+		// check if candidate_tp_name == "type"
+		if (candidate_tp_name == NULL)
+			continue;
+		if (strcmp(candidate_tp_name, "type") != 0)
+		{
+			free(candidate_tp_name);
+			candidate_tp_name = NULL;
+			continue;
+		}
+
+		InsertAddress(candidates, candidate_address_in_process);
+		if (candidates->used > 0)
+		{
+			free(candidate_tp_name);
+			candidate_tp_name = NULL;
+			break;
+		}
+	}
+	free(memory_region_ulong);
+	memory_region_ulong = NULL;
+	return candidates;
+}
+
+Addresses* safe_find_python_type_object_type_candidates_within_region(CommittedRegion* cr)
+{
+	__try
+	{
+		return find_python_type_object_type_candidates_within_region(cr);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		printf(
+			"Skipping region while searching python type-object-type candidates: address=%I64u size=%I64u\n",
+			cr != NULL ? cr->address : 0,
+			cr != NULL ? cr->region_size : 0
+		);
+		fflush(stdout);
+		return new_empty_addresses();
+	}
+}
+
+Addresses* find_python_type_object_type_candidates()
+{
+	Addresses* candidates = malloc(sizeof(Addresses));
+	InitAddresses(candidates);
+	unsigned int i;
+	for (i = 0; i < ps->used; ++i)
+	{
+		InsertAddresses(candidates, safe_find_python_type_object_type_candidates_within_region(ps->committed_regions[i]));
+		if (candidates->used > 0)
+			break;
+	}
+	return candidates;
+}
+
+Addresses* find_python_type_objects_candidates_within_region(CommittedRegion* cr, Addresses* previous_candidates, ULONGLONG min_candidate, ULONGLONG max_candidate)
+{
+	Addresses* candidates = malloc(sizeof(Addresses));
+	InitAddresses(candidates);
+	ULONGLONG* memory_region_ulong = read_memory_region_content_as_ulong_array(cr);
+	if (memory_region_ulong == NULL)
+	{
+		FreeAddresses(candidates);
+		return NULL;
+	}
+
+
+	UINT candidate_address_index;
+	for (candidate_address_index = 0; candidate_address_index < (cr->region_size / 8) - 4; ++candidate_address_index)
+	{
+		ULONGLONG candidate_address_in_process = cr->address + (ULONGLONG)candidate_address_index * 8;
+		ULONGLONG candidate_ob_type = memory_region_ulong[candidate_address_index + 1];
+
+		if (candidate_ob_type < min_candidate || max_candidate < candidate_ob_type)
+		{
+			continue;
+		}
+
+		if (!AddressesContains(previous_candidates, candidate_ob_type))
+		{
+			continue;
+		}
+
+		char* candidate_tp_name = read_string_from_address(memory_region_ulong[candidate_address_index + 3]);
+
+		
+		if (candidate_tp_name == NULL)
+			continue;
+		if (strcmp(candidate_tp_name, "UIRoot") != 0)
+		{
+			free(candidate_tp_name);
+			candidate_tp_name = NULL;
+			continue;
+		}
+
+		InsertAddress(candidates, candidate_address_in_process);
+		if (candidates->used > 0)
+		{
+			free(candidate_tp_name);
+			candidate_tp_name = NULL;
+			break;
+		}
+	}
+	free(memory_region_ulong);
+	memory_region_ulong = NULL;
+	return candidates;
+}
+
+Addresses* safe_find_python_type_objects_candidates_within_region(
+	CommittedRegion* cr,
+	Addresses* previous_candidates,
+	ULONGLONG min_candidate,
+	ULONGLONG max_candidate
+)
+{
+	__try
+	{
+		return find_python_type_objects_candidates_within_region(cr, previous_candidates, min_candidate, max_candidate);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		printf(
+			"Skipping region while searching python type-object candidates: address=%I64u size=%I64u\n",
+			cr != NULL ? cr->address : 0,
+			cr != NULL ? cr->region_size : 0
+		);
+		fflush(stdout);
+		return new_empty_addresses();
+	}
+}
+
+Addresses* find_python_type_objects_candidates(Addresses* previous_candidates)
+{
+    Addresses* candidates = malloc(sizeof(Addresses));
+    InitAddresses(candidates);
+
+    if (previous_candidates == NULL || previous_candidates->used < 1)
+        return candidates;
+
+    ULONGLONG min_candidate = find_min(previous_candidates->data, previous_candidates->used);
+    ULONGLONG max_candidate = find_max(previous_candidates->data, previous_candidates->used);
+
+    unsigned int i;
+    for (i = 0; i < ps->used; ++i)
+    {
+        InsertAddresses(
+            candidates,
+            safe_find_python_type_objects_candidates_within_region(
+                ps->committed_regions[i],
+                previous_candidates,
+                min_candidate,
+                max_candidate
+            )
+        );
+
+        if (candidates->used > 0)
+            break;
+    }
+
+    return candidates;
+}
+
+Addresses* find_python_type_candidates_within_region(CommittedRegion* cr, Addresses* previous_candidates, ULONGLONG min_candidate, ULONGLONG max_candidate)
+{
+	Addresses* candidates = malloc(sizeof(Addresses));
+	InitAddresses(candidates);
+	ULONGLONG* memory_region_ulong = read_memory_region_content_as_ulong_array(cr);
+	if (memory_region_ulong == NULL)
+		return candidates;
+
+	UINT candidate_address_index;
+	for (candidate_address_index = 0; candidate_address_index < (cr->region_size / 8) - 4; ++candidate_address_index)
+	{
+		ULONGLONG candidate_address_in_process = cr->address + (ULONGLONG)candidate_address_index * 8;
+		ULONGLONG candidate_ob_type = memory_region_ulong[candidate_address_index + 1];
+
+		if (candidate_ob_type < min_candidate || max_candidate < candidate_ob_type)
+		{
+			continue;
+		}
+
+		if (!AddressesContains(previous_candidates, candidate_ob_type))
+		{
+			continue;
+		}
+
+		InsertAddress(candidates, candidate_address_in_process);
+	}
+	free(memory_region_ulong);
+	memory_region_ulong = NULL;
+	return candidates;
+}
+
+Addresses* safe_find_python_type_candidates_within_region(
+	CommittedRegion* cr,
+	Addresses* previous_candidates,
+	ULONGLONG min_candidate,
+	ULONGLONG max_candidate
+)
+{
+	__try
+	{
+		return find_python_type_candidates_within_region(cr, previous_candidates, min_candidate, max_candidate);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		printf(
+			"Skipping region while searching python type candidates: address=%I64u size=%I64u\n",
+			cr != NULL ? cr->address : 0,
+			cr != NULL ? cr->region_size : 0
+		);
+		fflush(stdout);
+		return new_empty_addresses();
+	}
+}
+
+Addresses* find_python_type_candidates(Addresses* previous_candidates)
+{
+    Addresses* candidates = malloc(sizeof(Addresses));
+    InitAddresses(candidates);
+
+    if (previous_candidates == NULL || previous_candidates->used < 1)
+        return candidates;
+
+    ULONGLONG min_candidate = find_min(previous_candidates->data, previous_candidates->used);
+    ULONGLONG max_candidate = find_max(previous_candidates->data, previous_candidates->used);
+
+    unsigned int i;
+    for (i = 0; i < ps->used; ++i)
+    {
+        InsertAddresses(
+            candidates,
+            safe_find_python_type_candidates_within_region(
+                ps->committed_regions[i],
+                previous_candidates,
+                min_candidate,
+                max_candidate
+            )
+        );
+    }
+
+    return candidates;
+}
+
+Addresses* find_ui_roots()
+{
+	Addresses* ptot_candidates = find_python_type_object_type_candidates();
+
+	Addresses* pto_candidates = find_python_type_objects_candidates(ptot_candidates);
+	FreeAddresses(ptot_candidates);
+
+	Addresses* pt_candidates = find_python_type_candidates(pto_candidates);
+	FreeAddresses(pto_candidates);
+
+	return pt_candidates;
+}
+
+Addresses* get_ui_roots_from_process_sample_file()
+{
+	return find_ui_roots();
+}
+
+BOOL bytes_array_contains(byte* bytes, ULONGLONG size, ULONGLONG compareVal)
+{
+	if (bytes == NULL) return FALSE;
+	UINT i;
+	ULONGLONG x = bytes[size - 1];
+	if (x == compareVal)
+		return TRUE;
+	bytes[size - 1] = compareVal;
+	for (i = 0; bytes[i] != compareVal; i++);
+	bytes[size - 1] = x;
+	return i != bytes - 1;
+}
+
+BOOL string_array_contains(char* strings[], char* compareVal)
+{
+	UINT i = 0;
+	while (strings[i]) {
+		if (strcmp(strings[i], compareVal) == 0) {
+			return TRUE;
+		}
+		i++;
+	}
+	return FALSE;
+}
+
+char* get_python_type_name_from_python_type_object_address(ULONGLONG address)
+{
+	ULONGLONG bytes_read = 0;
+	byte* type_object_memory = read_bytes(address, 0x20, &bytes_read);
+
+	if (type_object_memory == NULL)
+		return NULL;
+
+	if (bytes_read != 0x20)
+	{
+		free(type_object_memory);
+		type_object_memory = NULL;
+		return NULL;
+	}
+
+	byte* sliced = slice_byte_array(type_object_memory, 0x20, 0x18, 0x20);
+	ULONGLONG tp_name = cast_byte_array_to_ulong(sliced, 0x20 - 0x18);
+	free(sliced);
+	sliced = NULL;
+
+	bytes_read = 0;
+	byte* name_bytes = read_bytes(tp_name, 100, &bytes_read);
+	if (!bytes_array_contains(name_bytes, bytes_read, 0))
+		return NULL;
+	
+	UINT length = 0;
+	UINT i = 0;
+	do
+		if (name_bytes[++length] == 0)
+			break;
+	while (i++ < bytes_read);
+	byte* null_terminated = slice_byte_array(name_bytes, bytes_read, 0, length);
+	char* response = malloc(sizeof(char) * length + 1);
+	memcpy_s(response, length, null_terminated, length);
+	response[length] = '\0';
+	free(name_bytes);
+	free(type_object_memory);
+	free(null_terminated);
+	name_bytes = NULL;
+	type_object_memory = NULL;
+	null_terminated = NULL;
+	return response;
+}
+
+char* get_python_type_name_from_python_object_address(ULONGLONG address)
+{
+	ULONGLONG hash_index = 0;
+	char* response = NULL;
+	if (response != NULL)
+		return response;
+	ULONGLONG bytes_read = 0;
+	byte* type_object_memory = read_bytes(address, 0x10, &bytes_read);
+
+	if (bytes_read != 0x10)
+	{
+		free(response);
+		free(type_object_memory);
+		response = NULL;
+		type_object_memory = NULL;
+		return NULL;
+	}
+	
+	byte* sliced = slice_byte_array(type_object_memory, 0x10, 8, 0x10);
+	ULONGLONG sliced_addr = cast_byte_array_to_ulong(sliced, 0x10 - 8);
+	free(response);
+	response = NULL;
+	response = get_python_type_name_from_python_type_object_address(sliced_addr);
+	free(sliced);
+	free(type_object_memory);
+	sliced = NULL;
+	type_object_memory = NULL;
+	if (response == NULL)
+		return NULL;
+	return response;
+}
+
+PyDictEntryList* read_active_dictionary_entries_from_address(ULONGLONG address)
+{
+	ULONGLONG bytes_read = 0;
+	byte* dict_memory = read_bytes(address, 0x30, &bytes_read);
+
+	if (bytes_read != 0x30)
+	{
+		free(dict_memory);
+		dict_memory = NULL;
+		return NULL;
+	}
+
+	ULONGLONG* ulong_dict_memory = cast_byte_array_to_ulong_array(dict_memory, bytes_read);
+
+	ULONGLONG ma_fill = ulong_dict_memory[2];
+	ULONGLONG ma_used = ulong_dict_memory[3];
+	ULONGLONG ma_mask = ulong_dict_memory[4];
+	ULONGLONG ma_table = ulong_dict_memory[5];
+
+	ULONGLONG number_of_slots = ma_mask + 1;
+
+	if (number_of_slots < 0 || 10000 < number_of_slots)
+	{
+		free(dict_memory);
+		free(ulong_dict_memory);
+		dict_memory = NULL;
+		ulong_dict_memory = NULL;
+		return NULL;
+	}
+	
+	ULONGLONG slots_memory_size = number_of_slots * 8 * 3;
+	bytes_read = 0;
+	byte* slots_memory = read_bytes(ma_table, slots_memory_size, &bytes_read);
+	if (bytes_read != slots_memory_size)
+	{
+		free(dict_memory);
+		free(ulong_dict_memory);
+		free(slots_memory);
+		dict_memory = NULL;
+		ulong_dict_memory = NULL;
+		slots_memory = NULL;
+		return NULL;
+	}
+	
+	ULONGLONG* ulong_slots_memory = cast_byte_array_to_ulong_array(slots_memory, bytes_read);
+	PyDictEntryList* entries = NewPyDictEntryList();
+
+	UINT slot_index;
+	for (slot_index = 0; slot_index < number_of_slots; ++slot_index)
+	{
+		ULONGLONG hash = ulong_slots_memory[slot_index * 3];
+		ULONGLONG key = ulong_slots_memory[slot_index * 3 + 1];
+		ULONGLONG value = ulong_slots_memory[slot_index * 3 + 2];
+
+		if (key == 0 || value == 0)
+		{
+			continue;
+		}
+
+		InsertPyDictEntry(entries, NewPyDictEntry(hash, key, value));
+	}
+
+	free(dict_memory);
+	free(ulong_dict_memory);
+	free(ulong_slots_memory);
+	free(slots_memory);
+	dict_memory = NULL;
+	ulong_dict_memory = NULL;
+	ulong_slots_memory = NULL;
+	slots_memory = NULL;
+
+	return entries;
+}
+
+char* read_python_string_value(ULONGLONG address, ULONGLONG max_length)
+{
+	ULONGLONG hash_index = 0;
+	char* response = NULL;
+	ULONGLONG bytes_read = 0;
+	byte* string_object_memory = read_bytes(address, 0x20, &bytes_read);
+
+	if (bytes_read != 0x20)
+	{
+		free(string_object_memory);
+		string_object_memory = NULL;
+		return NULL;
+	}
+
+	byte* sliced = slice_byte_array(string_object_memory, 0x20, 0x10, 0x10 + 8);
+	ULONGLONG string_object_size = cast_byte_array_to_ulong(sliced, 8);
+	free(sliced);
+	sliced = NULL;
+	free(string_object_memory);
+	string_object_memory = NULL;
+
+	if (0 < max_length && max_length < string_object_size || ULLONG_MAX < string_object_size)
+	{
+		return NULL;
+	}
+	
+	bytes_read = 0;
+	byte* string_bytes = read_bytes(address + 8 * 4, string_object_size, &bytes_read);
+
+	if (bytes_read != string_object_size)
+	{
+		free(string_bytes);
+		string_bytes = NULL;
+		return NULL;
+	}
+
+	response = malloc(sizeof(char) * (bytes_read + 1));
+	memcpy_s(response, bytes_read, string_bytes, bytes_read);
+	response[bytes_read] = '\0';
+	free(string_bytes);
+	string_bytes = NULL;
+	return response;
+}
+
+void read_python_type_str(ULONGLONG address, PythonDictValueRepresentation* repr)
+{
+	repr->is_string = TRUE;
+	repr->string_value = read_python_string_value(address, 0x1000);
+}
+
+char sanitize(byte utf)
+{
+	if (utf == '"')
+		return ' ';
+	else if (utf == '\'')
+		return ' ';
+	else if (utf == '\n')
+		return ' ';
+	else if (utf == '\r')
+		return ' ';
+	else if (utf < 0x21)
+		return ' ';
+	else
+		return (char)utf;
+}
+
+int utf8_encode(char* out, byte utf)
+{
+	if (utf <= 0x7F) {
+		// Plain ASCII
+		out[0] = sanitize(utf);
+		out[1] = '\0';
+		return 1;
+	}
+	else {
+		// error - use replacement character
+		out[0] = ' ';
+		out[1] = '\0';
+		return 1;
+	}
+}
+
+void read_python_type_unicode(ULONGLONG address, PythonDictValueRepresentation* repr)
+{
+	ULONGLONG bytes_read = 0;
+	byte* python_object_memory = read_bytes(address, 0x20, &bytes_read);
+
+	if (bytes_read != 0x20)
+	{
+		free(python_object_memory);
+		python_object_memory = NULL;
+		return;
+	}
+
+	byte* sliced = slice_byte_array(python_object_memory, bytes_read, 0x10, 0x10 + 8);
+	ULONGLONG unicode_string_length = cast_byte_array_to_ulong(sliced, 8);
+	free(sliced);
+	sliced = NULL;
+
+	if (unicode_string_length > 0x1000)
+	{
+		free(python_object_memory);
+		python_object_memory = NULL;
+		return;
+	}
+
+	ULONGLONG string_bytes_count = unicode_string_length * 2;
+	sliced = slice_byte_array(python_object_memory, bytes_read, 0x18, bytes_read);
+	ULONGLONG string_address = cast_byte_array_to_ulong(sliced, bytes_read - 0x18);
+	free(sliced);
+	sliced = NULL;
+	bytes_read = 0;
+	byte* string_bytes = read_bytes(string_address, string_bytes_count, &bytes_read);
+
+	if (bytes_read != string_bytes_count)
+	{
+		free(string_bytes);
+		free(python_object_memory);
+		string_bytes = NULL;
+		python_object_memory = NULL;
+		return;
+	}
+
+	char* response = malloc(sizeof(char) * bytes_read / 2 + 1);
+	memset(response, 0, bytes_read / 2 + 1);
+	UINT i = 0;
+	for (i = 0; i < bytes_read; i += 2)
+	{
+		char* utf8_decoded = malloc(sizeof(char) * 5);
+		memset(utf8_decoded, 0, 5);
+		size_t dstlen = strlen(response);
+		size_t srclen = utf8_encode(utf8_decoded, string_bytes[i]);
+		memcpy(response + dstlen, utf8_decoded, srclen);
+		free(utf8_decoded);
+		utf8_decoded = NULL;
+	}
+	response[bytes_read/2] = '\0';
+	repr->is_unicode = TRUE;
+	repr->unicode_value = response;
+	free(string_bytes);
+	free(python_object_memory);
+	string_bytes = NULL;
+	python_object_memory = NULL;
+	//printf("repr->unicode_value = '%s'\n", repr->unicode_value);
+}
+
+void read_python_type_int(ULONGLONG address, PythonDictValueRepresentation* repr)
+{
+	ULONGLONG bytes_read = 0;
+	byte* int_object_memory = read_bytes(address, 0x18, &bytes_read);
+
+	if (int_object_memory == NULL)
+		return;
+
+	if (bytes_read != 0x18)
+	{
+		free(int_object_memory);
+		int_object_memory = NULL;
+		return;
+	}
+
+	byte* sliced = slice_byte_array(int_object_memory, bytes_read, 0x10, bytes_read);
+	ULONGLONG value = cast_byte_array_to_ulong(sliced, bytes_read - 0x10);
+	free(sliced);
+	sliced = NULL;
+
+	repr->is_int = TRUE;
+	repr->int_value = value;
+	free(int_object_memory);
+	int_object_memory = NULL;
+}
+
+//Float in python is 64bit, so it's double in c
+void read_python_type_float_to_DOUBLE_type(ULONGLONG address, DOUBLE* return_value)
+{
+	ULONGLONG bytes_read = 0;
+	byte* python_object_memory = read_bytes(address, 0x20, &bytes_read);
+
+	if (python_object_memory == NULL)
+		return;
+
+	if (bytes_read != 0x20)
+	{
+		free(python_object_memory);
+		python_object_memory = NULL;
+		return;
+	}
+
+	byte* sliced = slice_byte_array(python_object_memory, bytes_read, 0x10, bytes_read);
+	*return_value = cast_byte_array_to_double(sliced);
+	free(sliced);
+	sliced = NULL;
+
+	free(python_object_memory);
+	python_object_memory = NULL;
+}
+
+void read_python_type_float(ULONGLONG address, PythonDictValueRepresentation* repr)
+{
+	DOUBLE double_value;
+	read_python_type_float_to_DOUBLE_type(address, &double_value);
+
+	repr->is_float = TRUE;
+	repr->float_value = double_value;
+}
+
+void read_python_type_bool(ULONGLONG address, PythonDictValueRepresentation* repr)
+{
+	ULONGLONG bytes_read = 0;
+	byte* bool_object_memory = read_bytes(address, 0x18, &bytes_read);
+
+	if (bytes_read != 0x18) {
+		return;
+	}
+	repr->is_bool = TRUE;
+	byte* sliced = slice_byte_array(bool_object_memory, bytes_read, 0x10, 0x10 + 8);
+	ULONGLONG response = cast_byte_array_to_ulong(sliced, 8);
+	free(sliced);
+	sliced = NULL;
+	repr->bool_value = response != 0;
+	free(bool_object_memory);
+	bool_object_memory = NULL;
+}
+
+PyDictEntryList* get_dict_entries_with_string_keys(ULONGLONG address)
+{
+	PyDictEntryList* dict_entries = read_active_dictionary_entries_from_address(address);
+
+	if (dict_entries == NULL)
+		return NULL;
+
+	UINT i;
+	for (i = 0; i < dict_entries->used; ++i)
+	{
+		dict_entries->data[i]->key_resolved = read_python_string_value(dict_entries->data[i]->key, 4000);
+	}
+
+	return dict_entries;
+}
+
+void read_python_type_bunch(ULONGLONG address, PythonDictValueRepresentation* repr)
+{
+	PyDictEntryList* dict_entries = read_active_dictionary_entries_from_address(address);
+	if (dict_entries == NULL)
+	{
+		return NULL;
+	}
+
+	UINT i;
+	for (i = 0; i < dict_entries->used; ++i)
+	{
+		char* key_object_type_name = get_python_type_name_from_python_object_address(dict_entries->data[i]->key);
+
+		if (key_object_type_name == NULL)
+		{
+			continue;
+		}
+
+		if (strcmp(key_object_type_name, "str") != 0)
+		{
+			free(key_object_type_name);
+			key_object_type_name = NULL;
+			continue;
+		}
+		free(key_object_type_name);
+		key_object_type_name = NULL;
+
+		char* key_string = read_python_string_value(dict_entries->data[i]->key, 4000);
+
+		if (strcmp(key_string, "htmlstr") != 0)
+		{
+			free(key_string);
+			key_string = NULL;
+			continue;
+		}
+		free(key_string);
+
+		PythonDictValueRepresentation* value_repr = get_dict_entry_value_representation(dict_entries->data[i]->value);
+		if (value_repr == NULL)
+			continue;
+
+		if (!value_repr->is_unicode) {
+			FreePythonDictValueRepresentation(value_repr);
+			continue;
+		}
+
+		repr->is_unicode = TRUE;
+		repr->unicode_value = _strdup(value_repr->unicode_value);
+		FreePythonDictValueRepresentation(value_repr);
+		break;
+	}
+	FreePyDictEntryList(dict_entries);
+}
+
+void read_value_percent_from_dict_entry_key(const char* dict_entry_key, PyDictEntryList* dictionary_entries, int* return_value)
+{
+	ULONGLONG value_address;
+
+	UINT i;
+	for (i = 0; i < dictionary_entries->used; ++i)
+	{
+		if (strcmp(dictionary_entries->data[i]->key_resolved, dict_entry_key) == 0) 
+		{
+			value_address = dictionary_entries->data[i]->value;
+			break;
+		}
+	}
+
+	if (value_address == NULL)
+	{
+		return;
+	}
+
+	DOUBLE value;
+	read_python_type_float_to_DOUBLE_type(value_address, &value);
+
+	*return_value = (int)(value * 100);
+}
+
+void read_python_type_PyColor(ULONGLONG address, PythonDictValueRepresentation* repr)
+{
+	ULONGLONG bytes_read = 0;
+	byte* py_color_object_memory = read_bytes(address, 0x18, &bytes_read);
+
+	if (py_color_object_memory == NULL)
+		return;
+
+	if (bytes_read != 0x18)
+	{
+		free(py_color_object_memory);
+		py_color_object_memory = NULL;
+		return;
+	}
+
+	byte* sliced = slice_byte_array(py_color_object_memory, bytes_read, 0x10, bytes_read);
+	free(py_color_object_memory);
+	py_color_object_memory = NULL;
+
+	ULONGLONG dictionary_address = cast_byte_array_to_ulong(sliced, bytes_read - 0x10);
+	free(sliced);
+	sliced = NULL;
+
+	PyDictEntryList* dictionary_entries = get_dict_entries_with_string_keys(dictionary_address);
+
+	if (dictionary_entries == NULL) 
+	{
+		free(dictionary_entries);
+		return;
+	}
+
+	PyColor* color_representation = malloc(sizeof(PyColor));
+
+	read_value_percent_from_dict_entry_key("_a", dictionary_entries, &color_representation->aPercent);
+	read_value_percent_from_dict_entry_key("_r", dictionary_entries, &color_representation->rPercent);
+	read_value_percent_from_dict_entry_key("_g", dictionary_entries, &color_representation->gPercent);
+	read_value_percent_from_dict_entry_key("_b", dictionary_entries, &color_representation->bPercent);
+
+	FreePyDictEntryList(dictionary_entries);
+	dictionary_entries = NULL;
+
+	repr->is_pycolor = TRUE;
+	repr->color_value = *color_representation;
+
+	free(color_representation);
+}
+
+PythonDictValueRepresentation* get_dict_entry_value_representation(ULONGLONG address)
+{
+	char* python_type_name = get_python_type_name_from_python_object_address(address);
+	if (python_type_name == NULL)
+		return NULL;
+
+	ULONGLONG hash_index = 0;
+	PythonDictValueRepresentation* repr = NULL;
+	if (repr != NULL)
+	{
+		free(python_type_name);
+		return repr;
+	}
+	repr = malloc(sizeof(PythonDictValueRepresentation));
+	if (repr == NULL)
+	{
+		printf("Failed to allocate memory for pyDictValueRepresentation");
+		exit(1);
+	}
+
+	repr->address = address;
+	repr->python_object_type_name = python_type_name;
+	repr->is_string = FALSE;
+	repr->is_unicode = FALSE;
+	repr->is_int = FALSE;
+	repr->is_float = FALSE;
+	repr->is_bool = FALSE;
+	repr->is_pycolor = FALSE;
+	repr->string_value = NULL;
+	repr->unicode_value = NULL;
+	repr->int_value = 0;
+	repr->bool_value = FALSE;
+	repr->float_value = 0.0;
+	repr->color_value.aPercent = 0;
+	repr->color_value.rPercent = 0;
+	repr->color_value.gPercent = 0;
+	repr->color_value.bPercent = 0;
+
+	if (strcmp(python_type_name, "str") == 0)
+		read_python_type_str(address, repr);
+	else if (strcmp(python_type_name, "unicode") == 0)
+		read_python_type_unicode(address, repr);
+	else if (strcmp(python_type_name, "int") == 0)
+		read_python_type_int(address, repr);
+	else if (strcmp(python_type_name, "bool") == 0)
+		read_python_type_bool(address, repr);
+	else if (strcmp(python_type_name, "float") == 0)
+		read_python_type_float(address, repr);
+	else if (strcmp(python_type_name, "Bunch") == 0)
+		read_python_type_bunch(address, repr);
+	else if (strcmp(python_type_name, "PyColor") == 0)
+		read_python_type_PyColor(address, repr);
+
+	return repr;
+}
+
+UITreeNode** read_children(UITreeNodeDictEntryList* dict_entries_of_interest, int max_depth, ULONGLONG* number_of_children)
+{
+	if (max_depth < 1)
+		return NULL;
+
+	UITreeNode** nodes = NULL;
+	UINT i;
+	for (i = 0; i < dict_entries_of_interest->used; ++i)
+	{
+		if (strcmp(dict_entries_of_interest->data[i]->key, "children") != 0)
+			continue;
+
+		ULONGLONG children_entry_object_address = dict_entries_of_interest->data[i]->value->address;
+		ULONGLONG bytes_read = 0;
+		byte* children_list_memory = read_bytes(children_entry_object_address, 0x18, &bytes_read);
+		if (bytes_read != 0x18)
+		{
+			free(children_list_memory);
+			children_list_memory = NULL;
+			return NULL;
+		}
+
+		byte* sliced = slice_byte_array(children_list_memory, bytes_read, 0x10, 0x10 + 8);
+		ULONGLONG children_dict_address = cast_byte_array_to_ulong(sliced, 8);
+		free(sliced);
+		sliced = NULL;
+		PyDictEntryList* children_dict_entries = read_active_dictionary_entries_from_address(children_dict_address);
+
+		if (children_dict_entries == NULL)
+		{
+			free(children_list_memory);
+			children_list_memory = NULL;
+			return NULL;
+		}
+
+		PyDictEntry* children_entry = NULL;
+		UINT i;
+		for (i = 0; i < children_dict_entries->used; ++i)
+		{
+			char* python_type_name = get_python_type_name_from_python_object_address(children_dict_entries->data[i]->key);
+			if (strcmp(python_type_name, "str") != 0)
+			{
+				free(python_type_name);
+				python_type_name = NULL;
+				continue;
+			}
+			char* key_string = read_python_string_value(children_dict_entries->data[i]->key, 4000);
+			if (strcmp(key_string, "_childrenObjects") == 0)
+			{
+				children_entry = children_dict_entries->data[i];
+				free(python_type_name);
+				free(key_string);
+				python_type_name = NULL;
+				key_string = NULL;
+				break;
+			}
+			free(python_type_name);
+			free(key_string);
+		}
+
+		if (children_entry == NULL)
+		{
+			free(children_list_memory);
+			FreePyDictEntryList(children_dict_entries);
+			children_list_memory = NULL;
+			return NULL;
+		}
+
+		byte* python_list_object_memory = NULL;
+		PyDictEntryList* py_children_list_dict_entries = NULL;
+
+		char* children_list_type = get_python_type_name_from_python_object_address(children_entry->value);
+		if (strcmp(children_list_type, "PyChildrenList") == 0) {
+			bytes_read = 0;
+			python_list_object_memory = read_bytes(children_entry->value, 0x20, &bytes_read);
+
+			if (python_list_object_memory == NULL)
+			{
+				free(children_list_memory);
+				FreePyDictEntryList(children_dict_entries);
+				children_list_memory = NULL;
+				return NULL;
+			}
+
+			if (bytes_read != 0x20)
+			{
+				free(python_list_object_memory);
+				free(children_list_memory);
+				FreePyDictEntryList(children_dict_entries);
+				python_list_object_memory = NULL;
+				children_list_memory = NULL;
+				return NULL;
+			}
+
+			sliced = slice_byte_array(python_list_object_memory, bytes_read, 0x10, 0x10 + 8);
+			if (sliced == NULL)
+			{
+				free(python_list_object_memory);
+				free(children_list_memory);
+				FreePyDictEntryList(children_dict_entries);
+				python_list_object_memory = NULL;
+				children_list_memory = NULL;
+				return NULL;
+			}
+			free(python_list_object_memory);
+			python_list_object_memory = NULL;
+
+			ULONGLONG py_children_list_dict_address = cast_byte_array_to_ulong(sliced, 8);
+			free(sliced);
+			sliced = NULL;
+
+			py_children_list_dict_entries = read_active_dictionary_entries_from_address(py_children_list_dict_address);
+			for (i = 0; i < py_children_list_dict_entries->used; ++i)
+			{
+				char* python_type_name = get_python_type_name_from_python_object_address(py_children_list_dict_entries->data[i]->key);
+				if (strcmp(python_type_name, "str") != 0)
+				{
+					free(python_type_name);
+					python_type_name = NULL;
+					continue;
+				}
+				char* key_string = read_python_string_value(py_children_list_dict_entries->data[i]->key, 4000);
+				if (strcmp(key_string, "_childrenObjects") == 0)
+				{
+					children_entry = py_children_list_dict_entries->data[i];
+					free(python_type_name);
+					free(key_string);
+					python_type_name = NULL;
+					key_string = NULL;
+					break;
+				}
+			}
+
+			if (children_entry == NULL)
+			{
+				free(children_list_memory);
+				FreePyDictEntryList(py_children_list_dict_entries);
+				FreePyDictEntryList(children_dict_entries);
+				children_list_memory = NULL;
+				py_children_list_dict_entries = NULL;
+				return NULL;
+			}
+		}
+		free(children_list_type);
+
+		bytes_read = 0;
+		python_list_object_memory = read_bytes(children_entry->value, 0x20, &bytes_read);
+
+		if (python_list_object_memory == NULL)
+		{
+			free(children_list_memory);
+			FreePyDictEntryList(py_children_list_dict_entries);
+			FreePyDictEntryList(children_dict_entries);
+			children_list_memory = NULL;
+			return NULL;
+		}
+
+		if (bytes_read != 0x20)
+		{
+			free(python_list_object_memory);
+			free(children_list_memory);
+			FreePyDictEntryList(py_children_list_dict_entries);
+			FreePyDictEntryList(children_dict_entries);
+			python_list_object_memory = NULL;
+			children_list_memory = NULL;
+			return NULL;
+		}
+
+		sliced = slice_byte_array(python_list_object_memory, bytes_read, 0x10, 0x10 + 8);
+		if (sliced == NULL)
+		{
+			free(python_list_object_memory);
+			free(children_list_memory);
+			FreePyDictEntryList(py_children_list_dict_entries);
+			FreePyDictEntryList(children_dict_entries);
+			python_list_object_memory = NULL;
+			children_list_memory = NULL;
+			return NULL;
+		}
+
+		ULONGLONG list_ob_size = cast_byte_array_to_ulong(sliced, 8);
+		free(sliced);
+		sliced = NULL;
+
+		if (list_ob_size > 4000)
+		{
+			free(python_list_object_memory);
+			free(children_list_memory);
+			FreePyDictEntryList(py_children_list_dict_entries);
+			FreePyDictEntryList(children_dict_entries);
+			python_list_object_memory = NULL;
+			children_list_memory = NULL;
+			return NULL;
+		}
+		
+		ULONGLONG list_entries_size = list_ob_size * 8;
+		sliced = slice_byte_array(python_list_object_memory, bytes_read, 0x18, 0x18 + 8);
+		ULONGLONG list_ob_item = cast_byte_array_to_ulong(sliced, 8);
+		free(sliced);
+		sliced = NULL;
+		bytes_read = 0;
+		byte* list_entry_memory = read_bytes(list_ob_item, list_entries_size, &bytes_read);
+
+		if (bytes_read != list_entries_size || list_entries_size == 0)
+		{
+			free(python_list_object_memory);
+			free(children_list_memory);
+			free(list_entry_memory);
+			FreePyDictEntryList(py_children_list_dict_entries);
+			FreePyDictEntryList(children_dict_entries);
+			python_list_object_memory = NULL;
+			children_list_memory = NULL;
+			list_entry_memory = NULL;
+			children_dict_entries = NULL;
+			return NULL;
+		}
+
+		ULONGLONG* list_entries = cast_byte_array_to_ulong_array(list_entry_memory, bytes_read);
+
+		nodes = malloc(sizeof(UITreeNode*) * bytes_read / 8);
+		for (i = 0; i < bytes_read / 8; ++i)
+		{
+			UITreeNode* tmp = read_ui_tree_from_address(list_entries[i], max_depth - 1);
+			if (tmp != NULL)
+				nodes[(*number_of_children)++] = tmp;
+		}
+		free(python_list_object_memory);
+		free(children_list_memory);
+		FreePyDictEntryList(py_children_list_dict_entries); // THIS MIGHT NEED TO GO AWAY
+		FreePyDictEntryList(children_dict_entries); // THIS MIGHT NEED TO GO AWAY
+		free(list_entries);
+		free(list_entry_memory);
+		python_list_object_memory = NULL;
+		children_list_memory = NULL;
+		list_entries = NULL;
+		list_entry_memory = NULL;
+		break; // only operate on first child
+	}
+	return nodes;
+}
+
+UITreeNode* read_ui_tree_from_address(ULONGLONG address, int max_depth)
+{
+	ULONGLONG bytes_read = 0;
+	byte* ui_node_object_memory = read_bytes(address, 0x30, &bytes_read);
+
+	if (ui_node_object_memory == NULL)
+		return NULL;
+
+	if (bytes_read != 0x30)
+	{
+		free(ui_node_object_memory);
+		ui_node_object_memory = NULL;
+		return NULL;
+	}
+
+	char* python_object_type_name = get_python_type_name_from_python_object_address(address);
+	if (python_object_type_name == NULL)
+	{
+		free(ui_node_object_memory);
+		ui_node_object_memory = NULL;
+		return NULL;
+	}
+	
+	if (python_object_type_name[0] == '\0')
+	{
+		free(python_object_type_name);
+		free(ui_node_object_memory);
+		python_object_type_name = NULL;
+		ui_node_object_memory = NULL;
+		return NULL;
+	}
+
+	byte* sliced = slice_byte_array(ui_node_object_memory, bytes_read, 0x10, 0x10 + 8);
+	ULONGLONG dict_address = cast_byte_array_to_ulong(sliced, 8);
+	free(sliced);
+	sliced = NULL;
+	PyDictEntryList* dict_entries = read_active_dictionary_entries_from_address(dict_address);
+
+	if (dict_entries == NULL)
+	{
+		free(ui_node_object_memory);
+		FreePyDictEntryList(dict_entries);
+		free(python_object_type_name);
+		ui_node_object_memory = NULL;
+		dict_entries = NULL;
+		python_object_type_name = NULL;
+		return NULL;
+	}
+
+	UITreeNodeDictEntryList* dict_entries_of_interest = NewUITreeNodeDictEntryList();
+
+	BOOL display = TRUE;
+	BOOL display_checked = FALSE;
+
+	UINT i;
+	for (i = 0; i < dict_entries->used; ++i)
+	{
+		char* key_object_type_name = get_python_type_name_from_python_object_address(dict_entries->data[i]->key);
+
+		if (key_object_type_name == NULL)
+		{
+			continue;
+		}
+
+		if (strcmp(key_object_type_name, "str") != 0)
+		{
+			free(key_object_type_name);
+			key_object_type_name = NULL;
+			continue;
+		}
+		free(key_object_type_name);
+		key_object_type_name = NULL;
+
+		char* key_string = read_python_string_value(dict_entries->data[i]->key, 4000);
+
+		if (!string_array_contains(DICT_KEYS_OF_INTEREST, key_string))
+		{
+			free(key_string);
+			key_string = NULL;
+			continue;
+		}
+
+		PythonDictValueRepresentation* repr = get_dict_entry_value_representation(dict_entries->data[i]->value);
+		if (repr == NULL)
+		{
+			free(key_string);
+			key_string = NULL;
+			continue;
+		}
+		if (strcmp(key_string, "_display") == 0 && repr->is_bool && !display_checked)
+		{
+			display = repr->bool_value;
+			display_checked = TRUE;
+		}
+		InsertUITreeNodeDictEntry(dict_entries_of_interest, NewUITreeNodeDictEntry(key_string, repr));
+	}
+
+	if (!display)
+	{
+		free(ui_node_object_memory);
+		FreePyDictEntryList(dict_entries);
+		FreeUITreeNodeDictEntryList(dict_entries_of_interest);
+		free(python_object_type_name);
+		ui_node_object_memory = NULL;
+		dict_entries = NULL;
+		dict_entries_of_interest = NULL;
+		python_object_type_name = NULL;
+		return NULL;
+	}
+
+	ULONGLONG number_of_children = 0;
+	UITreeNode** children = read_children(dict_entries_of_interest, max_depth, &number_of_children);
+	UITreeNode* node = malloc(sizeof(UITreeNode));
+	node->address = address;
+	node->dict_entries_of_interest = dict_entries_of_interest;
+	node->python_object_type_name = python_object_type_name;
+	node->children = children;
+	node->number_of_children = number_of_children;
+
+	free(ui_node_object_memory);
+	FreePyDictEntryList(dict_entries);
+	ui_node_object_memory = NULL;
+	++number_of_nodes;
+	return node;
+}
+
+
+__declspec(dllexport) void free_ui_json()
+{
+	if (ui_json == NULL)
+		return;
+	free(ui_json);
+	ui_json = NULL;
+}
+
+__declspec(dllexport) char* get_ui_json()
+{
+	return ui_json;
+}
+
+char* get_ui_tree_attr_string(UITreeNode* node, const char* key)
+{
+	if (node == NULL || node->dict_entries_of_interest == NULL || key == NULL)
+		return NULL;
+
+	UINT i;
+	for (i = 0; i < node->dict_entries_of_interest->used; ++i)
+	{
+		UITreeNodeDictEntry* entry = node->dict_entries_of_interest->data[i];
+		if (entry == NULL || entry->key == NULL || entry->value == NULL)
+			continue;
+
+		if (strcmp(entry->key, key) != 0)
+			continue;
+
+		if (entry->value->is_string && entry->value->string_value != NULL)
+			return entry->value->string_value;
+
+		if (entry->value->is_unicode && entry->value->unicode_value != NULL)
+			return entry->value->unicode_value;
+
+		return NULL;
+	}
+
+	return NULL;
+}
+
+BOOL ui_tree_has_type(UITreeNode* node, const char* type_name)
+{
+	if (node == NULL || type_name == NULL)
+		return FALSE;
+
+	if (node->python_object_type_name != NULL && strcmp(node->python_object_type_name, type_name) == 0)
+		return TRUE;
+
+	UINT i;
+	for (i = 0; i < node->number_of_children; ++i)
+	{
+		if (ui_tree_has_type(node->children[i], type_name))
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
+BOOL ui_tree_has_name(UITreeNode* node, const char* name)
+{
+	if (node == NULL || name == NULL)
+		return FALSE;
+
+	char* node_name = get_ui_tree_attr_string(node, "_name");
+	if (node_name != NULL && strcmp(node_name, name) == 0)
+		return TRUE;
+
+	UINT i;
+	for (i = 0; i < node->number_of_children; ++i)
+	{
+		if (ui_tree_has_name(node->children[i], name))
+			return TRUE;
+	}
+
+	return FALSE;
+}
+
+INT score_ui_root_candidate(UITreeNode* tree)
+{
+	if (tree == NULL)
+		return -1000000;
+
+	if (tree->python_object_type_name == NULL || strcmp(tree->python_object_type_name, "UIRoot") != 0)
+		return -1000000;
+
+	char* root_name = get_ui_tree_attr_string(tree, "_name");
+	if (root_name != NULL && strcmp(root_name, "desktopBlurred") == 0)
+		return -1000000;
+
+	INT score = 0;
+
+	// A real in-space EVE root normally contains these high-value nodes.
+	if (ui_tree_has_type(tree, "ShipUI")) score += 1000;
+	if (ui_tree_has_name(tree, "l_main")) score += 200;
+	if (ui_tree_has_name(tree, "l_viewstate")) score += 200;
+	if (ui_tree_has_name(tree, "l_view_overlays")) score += 100;
+	if (ui_tree_has_type(tree, "OverviewWindow")) score += 100;
+	if (ui_tree_has_type(tree, "ChatWindowStack")) score += 100;
+	if (ui_tree_has_type(tree, "ProbeScannerWindow")) score += 50;
+	if (ui_tree_has_type(tree, "StandaloneBookmarkWnd")) score += 50;
+
+	// Keep this weak. Child count alone was the old bug: desktopBlurred has
+	// several Fill children and accidentally passed the old >5 children check.
+	if (tree->number_of_children > 5) score += 5;
+
+	return score;
+}
+
+void set_ui_json_from_tree(UITreeNode* ui_tree)
+{
+	char* json_str = PrintUITreeNode(ui_tree, 0);
+	if (json_str == NULL)
+		return;
+
+	size_t json_str_len = strlen(json_str);
+
+	free_ui_json();
+	ui_json = malloc(json_str_len + 1);
+	if (ui_json == NULL)
+	{
+		free(json_str);
+		return;
+	}
+
+	memcpy_s(ui_json, json_str_len, json_str, json_str_len);
+	ui_json[json_str_len] = '\0';
+	free(json_str);
+}
+
+UITreeNode* safe_read_ui_tree_from_address(ULONGLONG address, UINT depth)
+{
+	UITreeNode* tree = NULL;
+
+	__try
+	{
+		tree = read_ui_tree_from_address(address, depth);
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		printf("Skipping candidate %I64u: exception while reading UI tree\n", address);
+		fflush(stdout);
+		tree = NULL;
+	}
+
+	return tree;
+}
+
+BOOL safe_score_ui_root_candidate(UITreeNode* tree, ULONGLONG address, INT* out_score)
+{
+	if (out_score == NULL)
+		return FALSE;
+
+	*out_score = -1000000;
+
+	__try
+	{
+		*out_score = score_ui_root_candidate(tree);
+		return TRUE;
+	}
+	__except (EXCEPTION_EXECUTE_HANDLER)
+	{
+		printf("Skipping candidate %I64u: exception while scoring UI tree\n", address);
+		fflush(stdout);
+		return FALSE;
+	}
+}
+
+__declspec(dllexport) void read_ui_trees()
+{
+	UINT i;
+	UITreeNode* best_tree = NULL;
+	ULONGLONG best_address = 0;
+	INT best_score = -1000000;
+
+	if (primary_ui_root != 0)
+	{
+		number_of_nodes = 0;
+		UITreeNode* primary_tree = safe_read_ui_tree_from_address(primary_ui_root, 99);
+
+		INT primary_score = -1000000;
+		safe_score_ui_root_candidate(primary_tree, primary_ui_root, &primary_score);
+
+		if (primary_tree != NULL && primary_score > 0)
+		{
+			set_ui_json_from_tree(primary_tree);
+			FreeUITreeNode(primary_tree);
+			return;
+		}
+
+		printf("Rejected cached primary UIRoot %I64u with score %d\n", primary_ui_root, primary_score);
+		fflush(stdout);
+
+		if (primary_tree != NULL)
+			FreeUITreeNode(primary_tree);
+
+		primary_ui_root = 0;
+	}
+
+	for (i = 0; i < ui_roots->used; ++i)
+	{
+		ULONGLONG candidate_address = ui_roots->data[i];
+
+		printf("Reading UIRoot candidate %I64u (%u/%I64u)\n", candidate_address, i + 1, ui_roots->used);
+		fflush(stdout);
+
+		number_of_nodes = 0;
+		UITreeNode* ui_tree = safe_read_ui_tree_from_address(candidate_address, 99);
+
+		if (ui_tree == NULL)
+			continue;
+
+		INT score = -1000000;
+		BOOL score_ok = safe_score_ui_root_candidate(ui_tree, candidate_address, &score);
+
+		if (!score_ok)
+		{
+			FreeUITreeNode(ui_tree);
+			continue;
+		}
+
+		char* root_name = get_ui_tree_attr_string(ui_tree, "_name");
+
+		printf(
+			"UIRoot candidate %I64u type=%s name=%s children=%I64u score=%d\n",
+			candidate_address,
+			ui_tree->python_object_type_name != NULL ? ui_tree->python_object_type_name : "<null>",
+			root_name != NULL ? root_name : "<none>",
+			ui_tree->number_of_children,
+			score
+		);
+		fflush(stdout);
+
+		if (score > best_score)
+		{
+			if (best_tree != NULL)
+				FreeUITreeNode(best_tree);
+
+			best_tree = ui_tree;
+			best_address = candidate_address;
+			best_score = score;
+		}
+		else
+		{
+			FreeUITreeNode(ui_tree);
+		}
+	}
+
+	if (best_tree != NULL && best_score > 0)
+	{
+		primary_ui_root = best_address;
+
+		printf("Selected UIRoot %I64u with score %d\n", best_address, best_score);
+		fflush(stdout);
+
+		set_ui_json_from_tree(best_tree);
+		FreeUITreeNode(best_tree);
+		return;
+	}
+
+	printf("No usable UIRoot candidate found. Best score was %d\n", best_score);
+	fflush(stdout);
+
+	free_ui_json();
+
+	if (best_tree != NULL)
+		FreeUITreeNode(best_tree);
+}
+
+__declspec(dllexport) void read_ui_trees_from_address(ULONGLONG address)
+{
+	number_of_nodes = 0;
+	UITreeNode* ui_tree = safe_read_ui_tree_from_address(address, 99);
+	if (ui_tree != NULL)
+	{
+		set_ui_json_from_tree(ui_tree);
+		FreeUITreeNode(ui_tree);
+	}
+}
+
+
+void get_memory_and_root_addresses(DWORD pid)
+{
+	printf("reading committed memory...\n");
+	ULONGLONG start_time = (unsigned long)time(NULL);
+	get_process_sample_from_pid(pid);
+	ULONGLONG ps_end_time = (unsigned long)time(NULL);
+	ULONGLONG ps_dur = ps_end_time - start_time;
+	printf("Finished processing memory in %I64u seconds!\n", ps_dur);
+
+	printf("finding UIRoot candidates...\n");
+	ui_roots = get_ui_roots_from_process_sample_file();
+	ULONGLONG ui_roots_end_time = (unsigned long)time(NULL);
+	ULONGLONG ui_roots_dur = ui_roots_end_time - ps_end_time;
+	printf("Finished finding %I64u UIRoot candidates in %I64u seconds!\n", ui_roots->used, ui_roots_dur);
+}
+
+
+__declspec(dllexport) int initialize(DWORD pid)
+{
+	primary_ui_root = 0;
+
+	if (pid == 0)
+		pid = get_pid(PROCESS_NAME);
+
+	if (pid == 0)
+	{
+		printf("Process not found\n");
+		return 1;
+	}
+
+	cache_last_flushed = (unsigned long)time(NULL);
+	printf("found %s process (pid: %d)\n", PROCESS_NAME, pid);
+	get_memory_and_root_addresses(pid);
+	return 0;
+}
+
+__declspec(dllexport) void free_string(char* str)
+{
+	if (str != NULL)
+	{
+		free(str);
+		str = NULL;
+	}
+}
+
+__declspec(dllexport) void cleanup()
+{
+	free_ui_json();
+	FreeProcessSample(ps);
+	FreeAddresses(ui_roots);
+}
+
+int main()
+{
+	return 0;
+}

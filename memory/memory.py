@@ -401,16 +401,16 @@ class EveMemoryReader:
 
             self.handle = None
 
-def pause(self) -> None:
-    """Pause the background native reader loop."""
-    if self.handle is not None:
-        self.handle.pause_event.set()
+    def pause(self) -> None:
+        """Pause the background native reader loop."""
+        if self.handle is not None:
+            self.handle.pause_event.set()
 
 
-def resume(self) -> None:
-    """Resume the background native reader loop."""
-    if self.handle is not None:
-        self.handle.pause_event.clear()
+    def resume(self) -> None:
+        """Resume the background native reader loop."""
+        if self.handle is not None:
+            self.handle.pause_event.clear()
 
 if __name__ == "__main__":
     readers = [EveMemoryReader(25812), EveMemoryReader(27676)]
