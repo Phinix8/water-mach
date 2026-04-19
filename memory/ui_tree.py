@@ -157,8 +157,8 @@ class UITree:
 
     def _initialize_until_usable_root(
             self,
-            attempts: int = 5,
-            per_attempt_timeout: float = 90.0,
+            attempts: int = 3,
+             per_attempt_timeout: float = 60.0
     ) -> UITreeNode:
         """
         Start/restart the memory reader until it returns a usable root.

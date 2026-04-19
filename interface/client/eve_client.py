@@ -52,36 +52,7 @@ class EvEClient:
         except Exception as exc:
             print(f"[WARN] Could not foreground EVE window before memory read: {exc}")
 
-    @staticmethod
-    def _manual_prepare_window(client_name: str, hwnd: Optional[int]) -> None:
-        """
-        Debug/manual fallback for Windows foreground restrictions.
-
-        The memory reader appears to select a UIRoot candidate during
-        initialization. If the client is blurred/backgrounded at that moment,
-        it can lock onto UIRoot:desktopBlurred.
-
-        In debug mode, we let the user explicitly bring the correct client to
-        the front before initializing the memory reader.
-        """
-        if hwnd:
-            try:
-                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-            except Exception:
-                pass
-
-        print()
-        print(f"[MANUAL INIT] Prepare EVE client: {client_name!r}")
-        print("  1. Bring this exact EVE window to the foreground.")
-        print("  2. Make sure the ship HUD is visible.")
-        print("  3. Make sure the client is fully loaded and in space.")
-        print("  4. Then press Enter here.")
-        input(f"[MANUAL INIT] Press Enter when 'EVE - {client_name}' is ready...")
-
-        # Give EVE/memory a small moment to settle after the window change.
-        time.sleep(0.75)
-
-    def __init__(self, client_name: str, manual_prepare: bool = False):
+    def __init__(self, client_name: str):
         self.client_name = client_name
 
         window_name = f"EVE - {client_name}"
@@ -95,10 +66,7 @@ class EvEClient:
             f"hwnd={self.hwnd}, pid={self.pid}, title={self.window_title!r}"
         )
 
-        if manual_prepare:
-            self._manual_prepare_window(client_name, self.hwnd)
-        else:
-            self._prepare_window_for_memory_reader(self.hwnd)
+        self._prepare_window_for_memory_reader(self.hwnd)
 
         self.input_handler = InputController(self.hwnd)
 

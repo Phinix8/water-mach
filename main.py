@@ -7,7 +7,6 @@ from bots.bt_sbmachs import SmartbombBot
 
 
 DEBUG_MODE = True
-MANUAL_CLIENT_INIT = True
 
 DEFAULT_CONFIG = {
     "character_names": ["player1", "player2", "player3"],

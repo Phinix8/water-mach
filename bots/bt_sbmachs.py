@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import time
-from typing import Iterable
 
 import py_trees
 from py_trees.common import Access
@@ -19,7 +18,6 @@ from behavioral_tree.bt_nodes import (
     IsCurrentTimePast,
     IsDreadNpcPresent,
     IsDreadGuristaNpcPresent,
-    IsEnemiesPresent,
     AreAllShipUIsReadable,
     IsSiteClearForDuration,
     IsLocalDangerous,
@@ -66,12 +64,11 @@ class SmartbombBot:
             tick_interval: float = 0.25,
             debug_mode: bool = False,
             debug_tree_interval: float = 1.0,
-            manual_client_init: bool = False,
     ) -> None:
         self.clients = []
 
         for name in client_names:
-            client = EvEClient(name, manual_prepare=manual_client_init)
+            client = EvEClient(name)
             self.clients.append(client)
 
         for client in self.clients:
@@ -174,25 +171,6 @@ class SmartbombBot:
             ]
         )
         return root
-
-    def _wait_until_ship_uis_readable(self) -> py_trees.behaviour.Behaviour:
-        """
-        Wait until every configured client exposes a readable ShipUI.
-
-        This returns RUNNING while some clients are unreadable instead of failing
-        the startup sequence and causing the OneShot startup to restart.
-        """
-        wait = py_trees.composites.Selector(
-            name="Wait Until Ship UIs Readable",
-            memory=False,
-        )
-        wait.add_children(
-            [
-                self._wait_until_ship_uis_readable(),
-                self._running("Waiting For Ship UIs To Become Readable"),
-            ]
-        )
-        return wait
 
     def _retry_until_success(
             self,
